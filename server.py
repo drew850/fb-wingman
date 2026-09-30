@@ -1,4 +1,4 @@
-# Wingman server — v3.1.0
+# Wingman server — v3.2.0
 # Storage: Postgres (DATABASE_URL). Notion is used ONLY by the one-time import + verify
 # jobs under /api/admin/*, server-side, and is never proxied for the browser.
 import os, json, re, urllib.request, urllib.error, secrets, hashlib, time, threading, queue, base64, traceback, uuid
@@ -16,7 +16,7 @@ except Exception as _imp_err:  # server still boots and reports the problem on /
     psycopg = None
     _PSYCOPG_IMPORT_ERROR = str(_imp_err)
 
-SERVER_VERSION      = "3.1.0"
+SERVER_VERSION      = "3.2.0"
 HTML_FILE           = "Wingman.html"
 PORT                = int(os.environ.get("PORT", 3747))
 DIR                 = os.path.dirname(os.path.abspath(__file__))
@@ -175,7 +175,8 @@ def render_emergency(error=None, status=200):
     html = EMERGENCY_HTML.replace("{error_block}", error_block).encode()
     return html, status
 
-# ── Contact reason options (injected into the page) ───────────────────────────
+# ── Contact reason options (legacy hardcoded list; v3.2.0 injects the LIVE list — see
+#    cr_options_for_inject(). These constants are no longer read; kept for reference) ──
 
 CR_L1_OPTIONS = [
     "Cancel",
@@ -359,11 +360,12 @@ def inject_env(html: bytes) -> bytes:
         "GORGIAS_CONFIGURED": bool(GORGIAS_USERNAME and GORGIAS_API_KEY),
         "STORAGE":            "postgres",
     }
+    cr_l1, cr_l2 = cr_options_for_inject()   # live Contact Reason options (hardcoded fallback)
     snippet = (
         "<script>"
         f"window.__ENV__={json.dumps(env)};"
-        f"window.__CR_L1_OPTIONS={json.dumps(CR_L1_OPTIONS)};"
-        f"window.__CR_L2_OPTIONS={json.dumps(CR_L2_OPTIONS)};"
+        f"window.__CR_L1_OPTIONS={json.dumps(cr_l1)};"
+        f"window.__CR_L2_OPTIONS={json.dumps(cr_l2)};"
         "</script>"
     )
     return html.replace(b"</head>", snippet.encode() + b"</head>", 1)
@@ -779,7 +781,8 @@ def censor(obj, extra_values=None):
     return _censor(obj, "", values_rx)
 
 CF_LABELS = {"9969": "Contact Reason", "5807": "Product", "11375": "Ticket Resolution",
-             "11421": "Additional Resolution", "7630": "Field 7630"}
+             "11421": "Additional Resolution", "7630": "AI Intent", "7629": "AI Agent Outcome",
+             "13131": "Managed sentiment", "18246": "Courier"}
 
 def snapshot_summary(s):
     raw = s["raw"] or {}
@@ -798,6 +801,109 @@ def snapshot_summary(s):
         "integrations": integ_types,
         "satisfaction": raw.get("satisfaction_survey"),
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CTF FIELD OPTIONS (v3.2.0) — live from Gorgias, hardcoded fallback
+# ══════════════════════════════════════════════════════════════════════════════
+# Dropdowns and filters use Gorgias's own custom-field definitions (choices are "L1::L2").
+# FALLBACK_FIELD_CHOICES is used only when Gorgias can't be reached. It was copied from the
+# live definitions on 2026-10-01; refresh it if Gorgias options change and the fallback matters.
+CTF_FIELD_IDS = {"contactReason": 9969, "product": 5807, "resolution": 11375, "addResolution": 11421}
+FALLBACK_FIELD_CHOICES = {
+    "contactReason": ["Order Status::No Delays","Order Status::Delays, but Not Lost","Order Status::International (No Delays)",
+        "Order Status::International (Delays, but Not Lost)","Order Status::Never Shipped","Order Status::Wrong Address",
+        "Order Status::Lost in Transit","Order Status::Delivered, Not Received","Order Status::Returned to Sender",
+        "Order Issue::Missing Item From Order","Order Issue::FB Wrong Item / Order","Order Issue::CX Wrong Item / Order",
+        "Order Issue::Package Damaged / Damaged Upon Arrival","Order Issue::Return Request","Order Issue::Return Follow Through",
+        "Update Order:: Add / Remove / Change Item","Update Order:: Change Address","Cancel::Cancel 1st Product Order",
+        "Cancel::Subscription Order","Cancel::Subscription (Unaware)","Cancel::Subscription (Aware)","Subscription::Change Frequency",
+        "Subscription::Change Product","Subscription::Change Address","Troubleshooting::Will Not Charge","Troubleshooting::Stopped Working",
+        "Troubleshooting::Broken Blade / Attachment","Troubleshooting:: Won't turn OFF","Troubleshooting::Never worked (new device)",
+        "Other::Promo Request/Issue","Other::Influencer/Job Inquiry","Other::Wholesale","Other::Payment/Charge Issues","Other::Other",
+        "Other::Negative Feedback","Other::Positive Feedback","Other::General Product Question","Other::Social General/Tagging",
+        "Order Issue::Received Used Product","Order Issue::Received Unsatisfactory Product","Other::System Notification",
+        "Other::General Order Question","Other:: Update Account","Subscription::Skip Order","Order Issue::Missing Item From Kit",
+        "Other::Multi-Channel Duplicate"],
+    "product": ["No Applicable Product","Product::Blade Refills FlexSeries Pro","Product::Blade Refills FlexSeries",
+        "Product::Blade Refills FlexSeries Women's","Product::FlexSeries","Product::FlexSeries Pro","Product::FlexSeries Shaving Kit for Women",
+        "Product::BeardSeries Trimmer","Accessories::Travel Case","Accessories::Precision Clipper & Guards","Shave Care::Kit",
+        "Shave Care::Lubricating Pre-Shave Oil","Shave Care::Soothing Shave Gel","Shave Care::Hydrating Post-Shave Lotion","Scalp Care::Kit",
+        "Scalp Care::Detoxifying Bald Head Cleanser","Scalp Care::Purifying Scalp Exfoliating Scrub","Scalp Care::Refreshing Scalp Moisturizer",
+        "Scalp Care::Head & Body Wipes","Accessories::Attachment Kit","Accessories::Travel Case & Charging Dock"],
+    "resolution": ["NA/No Response","Information Given","Return Prevented:: Partial Refund","Return Prevented:: Successful Troubleshooting",
+        "Return Prevented:: Information/Tips Given","Replacement Sent:: Warranty","Replacement Sent:: Shipping Issue",
+        "Replacement Sent::Manufacturer Issue","Replacement Sent::Goodwill Replacement","Sub Cancelation Prevented:: Successful Troubleshooting",
+        "Sub Cancelation Prevented:: Benefits Explained","Sub Cancelation Prevented:: Changed Refill Frequency","Sub Cancelation Prevented:: Other",
+        "Sub Cancelled::No Reason Provided","Sub Cancelled:: Too expensive","Sub Cancelled:: Enough Stock","Sub Cancelled:: Gifted Shaver",
+        "Sub Cancelled:: Unsatisfied","Sub Cancelled:: No Longer Need","Return for Refund::Duplicate Order","Cancelled Order",
+        "Updated:: Customer Information","Return for Refund::Gifted Shaver","Return for Refund::Quality Complaint",
+        "Return for Refund::Accidental Purchase","Return for Refund::Doesn't Provide a Close Shave","Return for Refund::Misleading Advertisement",
+        "Return for Refund::Using a Competitor","Return for Refund::Other","Sub Cancelation Prevented:: Partial Refund",
+        "Sub Cancelation Prevented:: Upgrade","Return for Refund::One Time Exception","Hid/Removed Social Comment",
+        "Sub Cancelled:: Accidental Subscriber","Updated::Subscription","Updated::Order","Return for Refund::Returnless Refund"],
+    "addResolution": ["No Additional Resolution","Return Prevented:: Partial Refund","Return Prevented:: Successful Troubleshooting",
+        "Return Prevented:: Information/Tips Given","Replacement Sent:: Warranty","Replacement Sent:: Shipping Issue",
+        "Replacement Sent::Manufacturer Issue","Sub Cancelation Prevented:: Successful Troubleshooting","Sub Cancelation Prevented:: Upgrade",
+        "Sub Cancelation Prevented:: Benefits Explained","Sub Cancelation Prevented:: Changed Refill Frequency",
+        "Sub Cancelation Prevented:: Partial Refund","Sub Cancelation Prevented:: Other","Sub Cancelled:: Too expensive",
+        "Sub Cancelled:: Enough Stock","Sub Cancelled:: Gifted Shaver","Sub Cancelled:: Unsatisfied","Sub Cancelled:: No Longer Need",
+        "Sub Cancelled::Accidental Subscriber","Updated::Customer Information","Cancelled Order","Updated::Subscription","Updated::Order",
+        "Other::Internal Note","Return for Refund::Gifted Shaver","Return for Refund::Duplicate Order","Return for Refund::Quality Complaint",
+        "Return for Refund::Accidental Purchase","Return for Refund::Doesn't Provide a Close Shave","Return for Refund::Misleading Advertisement",
+        "Return for Refund::Using a Competitor","Return for Refund::Other","Return for Refund::One Time Exception",
+        "Replacement Sent::Goodwill Replacement"],
+}
+FIELD_CACHE = {"at": 0.0, "data": None, "error": ""}
+FIELD_CACHE_TTL = 3600
+FIELD_CACHE_LOCK = threading.Lock()
+
+def split_choice(c):
+    """'Update Order:: Change Address' -> ('Update Order', 'Change Address'); 'Cancelled Order' -> ('Cancelled Order', '')."""
+    parts = str(c).split("::", 1)
+    return parts[0].strip(), (parts[1].strip() if len(parts) > 1 else "")
+
+def get_ctf_field_options(force=False):
+    """{source, fetchedAt, error, fields:{key:[choices]}} — live when possible, fallback otherwise. Never raises."""
+    with FIELD_CACHE_LOCK:
+        fresh = FIELD_CACHE["data"] is not None and (time.time() - FIELD_CACHE["at"]) < FIELD_CACHE_TTL
+        if fresh and not force:
+            return FIELD_CACHE["data"]
+    live, err = {}, ""
+    if GORGIAS_USERNAME and GORGIAS_API_KEY:
+        try:
+            for key, fid in CTF_FIELD_IDS.items():
+                d = gorgias_get(f"/custom-fields/{fid}")
+                choices = (d.get("definition") or {}).get("input_settings", {}).get("choices") or d.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    raise RuntimeError(f"field {fid} returned no choices")
+                live[key] = [str(c) for c in choices if c is not None and str(c).strip()]
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            live = {}
+    else:
+        err = "Gorgias not configured"
+    if live:
+        data = {"source": "live", "fetchedAt": now_iso(), "error": "", "fields": live}
+    else:
+        prev = FIELD_CACHE["data"]
+        if prev and prev.get("source") == "live":      # keep the last good live copy if a refresh fails
+            data = dict(prev, error="refresh failed, serving last live copy: " + err)
+        else:
+            data = {"source": "fallback", "fetchedAt": None, "error": err, "fields": FALLBACK_FIELD_CHOICES}
+        print(f"[Fields] live fetch failed ({err}); using {data['source']}")
+    with FIELD_CACHE_LOCK:
+        FIELD_CACHE.update({"at": time.time(), "data": data, "error": err})
+    return data
+
+def cr_options_for_inject():
+    """Legacy window.__CR_L1_OPTIONS / __CR_L2_OPTIONS, now derived from the live Contact Reason field."""
+    data = FIELD_CACHE["data"] or {"fields": FALLBACK_FIELD_CHOICES}
+    l1, l2 = [], {}
+    for c in data["fields"].get("contactReason") or []:
+        a, b = split_choice(c)
+        if a not in l1: l1.append(a)
+        if b: l2.setdefault(a, []).append(b)
+    return l1, l2
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  NOTION (server-side, import + verify only)
@@ -1757,11 +1863,15 @@ def api_admin_snapshot_retry(h, user, pp, qs, body):
     db_exec("UPDATE tickets SET snapshot_attempts=0 WHERE snapshot_status='failed'")
     return {"requeued": requeue_pending_snapshots()}
 
+def api_gorgias_fields(h, user, pp, qs, body):
+    return get_ctf_field_options(force=(qs.get("refresh") == "1" and role_rank(user["role"]) >= 2))
+
 UUID_RX = r"(?P<id>[0-9a-fA-F-]{32,36})"
 KEY_RX  = r"(?P<key>[A-Za-z0-9_.\-]+)"
 # (method, path regex, fn, min role rank, is_write).  Writes are refused until cutover.
 ROUTES = [
     ("GET",    r"/me",                                api_me,                   0, False),
+    ("GET",    r"/gorgias/fields",                    api_gorgias_fields,       0, False),
     ("GET",    r"/users",                             api_users_list,           0, False),
     ("POST",   r"/users",                             api_users_create,         2, True),
     ("PATCH",  r"/users/" + UUID_RX,                  api_users_update,         2, True),
@@ -1774,7 +1884,7 @@ ROUTES = [
     ("PATCH",  r"/tickets/" + UUID_RX,                api_ticket_patch,         0, True),
     ("GET",    r"/config/" + KEY_RX + r"/history",    api_config_history,       1, False),
     ("GET",    r"/config/" + KEY_RX,                  api_config_get,           0, False),
-    ("PUT",    r"/config/" + KEY_RX,                  api_config_put,           1, True),
+    ("PUT",    r"/config/" + KEY_RX,                  api_config_put,           2, True),   # v3.2.0: Full only (matrix, autofails, context, baseline)
     ("GET",    r"/reports",                           api_reports_list,         0, False),
     ("PUT",    r"/reports",                           api_reports_put,          1, True),
     ("GET",    r"/calib/rounds",                      api_rounds_list,          1, False),
@@ -2183,4 +2293,5 @@ if __name__ == "__main__":
         print(f"Cutover: {cutover_state()}")
         print(f"Snapshots requeued: {requeue_pending_snapshots()}")
     threading.Thread(target=snapshot_worker, daemon=True).start()
+    threading.Thread(target=get_ctf_field_options, daemon=True).start()   # warm the live CTF option cache
     Server(("0.0.0.0", PORT), Handler).serve_forever()

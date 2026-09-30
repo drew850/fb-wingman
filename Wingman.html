@@ -2,10 +2,37 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.1.0
+  Version:  3.2.0
   Date:     2026-10-01
 
   Changelog:
+  v3.2.0 (2026-10-01) -- LIVE CTF OPTIONS, PRIORITY FILTERS, ONE-FIELD MANUAL AUDIT, MATRIX + SETTINGS REDESIGN
+    - LIVE CTF OPTIONS: Contact Reason / Product / Ticket Resolution / Additional Resolution options now come from
+      Gorgias's custom-field definitions (GET /api/gorgias/fields; server caches 1h, keeps the last good copy if a
+      refresh fails, and falls back to a hardcoded list copied from Gorgias on 2026-10-01). Fixes the stale built-in
+      list, which was missing "Other::Multi-Channel Duplicate" and "Order Issue::Return Follow Through".
+      L2 dropdowns narrow to the L1s selected. The server's injected CR lists are live too.
+    - Sidebar group "Fetch" -> "Tickets"; "Fetch Tickets" -> "Search Tickets" (UI only). Duplicate page/card
+      descriptions merged into one.
+    - SEARCH TICKETS: Resolution L1/L2 and Add. Resolution L1/L2 are live multi-select dropdowns (were free text).
+    - BATCH FETCH PRIORITY FILTERS: Contact Reason L1/L2, Resolution L1/L2, Add. Resolution L1/L2. Filters are
+      priorities, not hard limits: the generated SQL scores every ticket by how many filters it misses and fills each
+      agent's target with exact matches first, then the closest near-misses. Run summary shows, per agent, exact /
+      1-off / 2+-off / short of target and the most-missed filters (checked against LIVE Gorgias tags).
+      With no filters the SQL is identical to before. Verified against the warehouse (custom_fields_ticket_values).
+    - MANUAL AUDIT: one input (ticket ID). "Load from Gorgias" pulls the ticket, tags, counts and transcript; tags are
+      shown read-only (CTF Accuracy scores them as tagged). Scoring now uses the same prompt/result as AI Audit
+      (buildEvalPrompt + calcScore) — v2's manual prompt had no Product/Resolution tags, scoring context or real
+      autofail list. Warns on already-audited, deleted, excluded-agent and missing-assignee tickets.
+    - MATRIX: redesigned as read-only cards (navy header rule, MAX n PT badge, color-coded level table). Full users
+      get an Edit button per section; text boxes auto-fit and stay resizable; "Unsaved changes" indicator.
+      Edit users can now open the Matrix read-only. Config writes are Full-only on the server as well.
+    - SETTINGS: horizontal tabs "User Management" (team members, add team member, role legend) and "Admin Tools"
+      (Database, Data Integrity, One-time CTF correction as its own card). Tab ids unchanged internally.
+    - Gorgias field 7630 labelled "AI Intent" in the ticket data panel.
+    - FIX (multi-select filters, incl. Search Tickets Contact Reason): "Clear" then ticking one value left a map with only
+      that value, which the filter check read as "all selected", so the filter did nothing. Maps now hold every option.
+
   v3.1.0 (2026-10-01) -- NEW NAVIGATION SHELL (UI only; no data, API or behavior changes)
     - Left sidebar (navy #1a1a2e) replaces the header + tab row. Sections: Home / Fetch (Fetch Tickets, Batch
       Fetch) / QA (AI Audit, Manual Audit, Review Audits) / Analytics (Generate Reports, View Reports) / Matrix /
@@ -872,7 +899,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.1.0";
+const APP_VERSION = "v3.2.0";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -1831,7 +1858,7 @@ var sectionLabel = { fontSize: "11px", fontWeight: 700, textTransform: "uppercas
 //   teamcal       Team Calibration  (unchanged)
 const UI_LABELS = {
   dashboard:   "Home",
-  fetch:       "Fetch Tickets",
+  fetch:       "Search Tickets",   // v3.2.0 (was "Fetch Tickets")
   fetchv2:     "Batch Fetch",
   batch:       "AI Audit",
   manual:      "Manual Audit",
@@ -1847,24 +1874,24 @@ const UI_LABELS = {
 // One-line page descriptions shown under each page title.
 const UI_LEDES = {
   dashboard:   "This week at a glance.",
-  fetch:       "Pull closed tickets from Gorgias for a date range and assign them to auditors.",
-  fetchv2:     "Select tickets in bulk from the warehouse and send them to AI Audit.",
+  fetch:       "Find Gorgias tickets by date, agent, channel and CTF tags, preview them, then send them to AI Audit or save as CSV.",
+  fetchv2:     "Let the warehouse pick each agent's tickets for a week — with optional priority filters — then fetch and send them to AI Audit.",
   batch:       "Score queued tickets against the matrix with AI.",
-  manual:      "Score a ticket yourself against the matrix.",
+  manual:      "Enter a Gorgias ticket ID — Wingman loads the ticket and scores it exactly like AI Audit.",
   review:      "Open an audit to review scores, justifications and disputes.",
   reports:     "Build weekly performance reports for each agent. Agents see theirs in View Reports.",
   myreports:   "Weekly reports shared with each agent.",
-  matrix:      "The scoring rubric the AI and auditors use.",
+  matrix:      "The scoring rubric the AI and auditors use. Only Full users can edit it.",
   calibration: "Compare AI scores with auditor scores to find where the matrix needs tightening.",
   teamcal:     "Blind-score the same tickets as a team and compare results.",
   ctf:         "Contact reason options used for CTF scoring.",
-  settings:    "Access, users, database and team configuration."
+  settings:    "Team members, access and admin tools."
 };
 // Sidebar structure. `min` = minimum role (view < edit < full); mirrors the v3.0.0 tab filters.
 // "reports" is hidden from view-only users (they use View Reports), same as before.
 const NAV_MENU = [
   {view:"dashboard", icon:"home", min:"view"},
-  {group:"Fetch", items:[
+  {group:"Tickets", items:[                    // v3.2.0: group renamed from "Fetch" (UI only)
     {view:"fetch",   icon:"fetch",      min:"edit"},
     {view:"fetchv2", icon:"batchfetch", min:"edit"}]},
   {group:"QA", items:[
@@ -1874,7 +1901,7 @@ const NAV_MENU = [
   {group:"Analytics", items:[
     {view:"reports",   icon:"genreports",  min:"edit"},
     {view:"myreports", icon:"viewreports", min:"view"}]},
-  {view:"matrix", icon:"matrix", min:"full"},
+  {view:"matrix", icon:"matrix", min:"edit"},   // v3.2.0: Edit users can read the matrix; only Full can edit
   {group:"Calibration", items:[
     {view:"calibration", icon:"aical",   min:"full"},
     {view:"teamcal",     icon:"teamcal", min:"edit"}]}
@@ -1998,6 +2025,128 @@ const STATUS_OPTS = ["closed","open"];
 const CHANNEL_OPTS = ["api","chat","contact_form","email","facebook","facebook-messenger","help-center","instagram-ad-comment","instagram-comment","instagram-direct-message","sms"];
 const CR_L1_OPTS = ["Cancel","Order Issue","Order Status","Other","Subscription","Troubleshooting","Update Order"];
 const CR_L2_OPTS = ["Add / Remove / Change Item","Broken Blade / Attachment","Cancel 1st Product Order","Change Address","Change Frequency","Change Product","CX Wrong Item / Order","Delays, but Not Lost","Delivered, Not Received","FB Wrong Item / Order","General Order Question","General Product Question","Influencer/Job Inquiry","International (Delays, but Not Lost)","International (No Delays)","Lost in Transit","Missing Item From Kit","Missing Item From Order","Multi-Channel Duplicate","Negative Feedback","Never Shipped","Never worked (new device)","No Delays","Other","Package Damaged / Damaged Upon Arrival","Payment/Charge Issues","Positive Feedback","Promo Request/Issue","Received Unsatisfactory Product","Received Used Product","Return Follow Through","Return Request","Returned to Sender","Skip Order","Social General/Tagging","Stopped Working","Subscription (Aware)","Subscription (Unaware)","Subscription Order","System Notification","Update Account","Will Not Charge","Won't turn OFF","Wrong Address"];
+// ── LIVE CTF OPTIONS (v3.2.0) ────────────────────────────────────────────────
+// Options for Contact Reason / Product / Ticket Resolution / Additional Resolution come from
+// Gorgias's custom-field definitions via GET /api/gorgias/fields (server caches 1h and falls back
+// to a hardcoded copy). Choices are "L1::L2"; these helpers split them for L1/L2 dropdowns.
+// CR_L1_OPTS / CR_L2_OPTS above are only the client-side last resort if that call fails.
+var CTF_FIELD_KEYS = ["contactReason","product","resolution","addResolution"];
+function ctfSplit(choice){
+  var p = String(choice||"").split("::");
+  return [String(p[0]||"").trim(), p.length>1 ? p.slice(1).join("::").trim() : ""];
+}
+function ctfL1List(choices){
+  var out=[]; (choices||[]).forEach(function(c){ var a=ctfSplit(c)[0]; if(a && out.indexOf(a)===-1) out.push(a); }); return out;
+}
+// L2 options; when l1Filter (array of L1 values) is given, only L2s under those L1s.
+function ctfL2List(choices, l1Filter){
+  var want = (l1Filter&&l1Filter.length) ? l1Filter.map(function(x){return String(x).toLowerCase();}) : null;
+  var out=[]; (choices||[]).forEach(function(c){ var p=ctfSplit(c); if(!p[1]) return;
+    if(want && want.indexOf(p[0].toLowerCase())===-1) return;
+    if(out.indexOf(p[1])===-1) out.push(p[1]); });
+  return out.sort(function(a,b){return a.localeCompare(b);});
+}
+// Multi-select maps ({value:true}) — "all selected" or "none selected" both mean "no filter".
+function selIsActive(m){ var ks=Object.keys(m||{}); var n=ks.filter(function(k){return m[k];}).length; return n>0 && n<ks.length; }
+function selValuesLower(m){ return Object.keys(m||{}).filter(function(k){return m[k];}).map(function(s){return String(s).toLowerCase().trim();}); }
+function selChosen(m){ return Object.keys(m||{}).filter(function(k){return m[k];}); }
+// When live options arrive, a filter that was "All" stays "All" (new options included);
+// a partial selection keeps its picks and leaves new options unticked.
+function selRebase(m, options){
+  var ks = Object.keys(m||{});
+  var wasAll = ks.length===0 || ks.every(function(k){return m[k];});   // empty map = never touched = "All"
+  var out={}; (options||[]).forEach(function(o){ out[o] = wasAll ? true : !!(m&&m[o]); }); return out;
+}
+
+// ── BATCH FETCH PRIORITY FILTERS (v3.2.0) ───────────────────────────────────
+// Filters are PRIORITIES, not hard filters: every ticket gets a mismatch count (how many active
+// filters it misses; 0 = exact match), and each agent's top-N is taken by mismatch ASC first, then
+// assigned-agent replies DESC. So agents fill their target with exact matches, and only top up from
+// the closest near-misses when they run short. Pure function so it can be tested on its own.
+var V2_FILTER_DEFS = [
+  {key:"crL1",     label:"Contact Reason L1",  field:"Contact Reason",               part:0, opts:"contactReason"},
+  {key:"crL2",     label:"Contact Reason L2",  field:"Contact Reason",               part:1, opts:"contactReason"},
+  {key:"resL1",    label:"Resolution L1",      field:"Ticket Resolution",            part:0, opts:"resolution"},
+  {key:"resL2",    label:"Resolution L2",      field:"Ticket Resolution",            part:1, opts:"resolution"},
+  {key:"addResL1", label:"Add. Resolution L1", field:"Additional Ticket Resolution", part:0, opts:"addResolution"},
+  {key:"addResL2", label:"Add. Resolution L2", field:"Additional Ticket Resolution", part:1, opts:"addResolution"}
+];
+function v2ActiveFilters(filters){
+  return V2_FILTER_DEFS.filter(function(d){ return selIsActive(filters&&filters[d.key]); })
+    .map(function(d){ return Object.assign({}, d, {values: selValuesLower(filters[d.key])}); });
+}
+function v2SqlStr(v){ return "'"+String(v).replace(/\\/g,"\\\\").replace(/'/g,"\\'")+"'"; }
+var V2_FIELD_COL = {"Contact Reason":"cr", "Ticket Resolution":"res", "Additional Ticket Resolution":"addres"};
+// Returns "" when no filters are active (query stays exactly as before).
+function v2CtfSql(active, startDate, endDate){
+  if(!active || !active.length) return {ctes:"", source:"per_ticket", mismatch:"0"};
+  var cols = {}; active.forEach(function(a){ cols[a.field]=true; });
+  var sel = Object.keys(cols).map(function(f){
+    return "    MAX(IF(cf.label = "+v2SqlStr(f)+", cf.customer_field_value, NULL)) AS "+V2_FIELD_COL[f];
+  }).join(",\n");
+  var terms = active.map(function(a){
+    var col = "COALESCE(c."+V2_FIELD_COL[a.field]+", '')";
+    var part = a.part===0
+      ? "LOWER(TRIM(SPLIT("+col+", '::')[SAFE_OFFSET(0)]))"
+      : "LOWER(TRIM(COALESCE(SPLIT("+col+", '::')[SAFE_OFFSET(1)], '')))";
+    return "      IF("+part+" IN ("+a.values.map(v2SqlStr).join(", ")+"), 0, 1)  -- "+a.label;
+  }).join("\n    + ");
+  var ctes = "ctf AS (\n  SELECT t.ticket_id,\n"+sel+"\n"
+    +"  FROM gaia.tickets AS t\n  CROSS JOIN UNNEST(t.custom_fields_ticket_values) AS cf\n"
+    +"  WHERE t.ticket_created_date BETWEEN '"+startDate+"' AND '"+endDate+"'\n  GROUP BY 1\n),\n"
+    +"scored AS (\n  SELECT p.*, (\n    "+terms+"\n  ) AS mismatch\n"
+    +"  FROM per_ticket AS p\n  LEFT JOIN ctf AS c USING (ticket_id)\n),\n";
+  return {ctes:ctes, source:"scored", mismatch:"p.mismatch"};
+}
+// Client-side twin, run on the LIVE tags of each fetched ticket (the warehouse refreshes daily).
+function v2TicketMismatch(active, tags){
+  var missed = [];
+  active.forEach(function(a){
+    var raw = a.field==="Contact Reason" ? tags.cr : a.field==="Ticket Resolution" ? tags.res : tags.addres;
+    var v = String((raw||["",""])[a.part]||"").toLowerCase().trim();
+    if(a.values.indexOf(v)===-1) missed.push(a.label);
+  });
+  return missed;
+}
+
+// ── MATRIX PRESENTATION (v3.2.0) ─────────────────────────────────────────────
+// Level colors use Wingman's success / warning / danger hues at full strength so the level column
+// reads at a glance; custom level names fall back to slate.
+var MATRIX_LEVEL_COLORS = {YES:"#1f8a5b", PARTIAL:"#b7791f", NO:"#c53030", NA:"#6b7280"};
+function matrixLevelColor(level){ return MATRIX_LEVEL_COLORS[String(level||"").trim().toUpperCase()] || "#475569"; }
+// Textarea that grows to fit its text; users can still drag it taller.
+function AutoTextarea(props){
+  var ref = useRef(null);
+  useEffect(function(){ var el=ref.current; if(!el) return; el.style.height="auto"; el.style.height=(el.scrollHeight+2)+"px"; }, [props.value]);
+  var rest = Object.assign({}, props); delete rest.style;
+  return <textarea ref={ref} {...rest} style={Object.assign({width:"100%",boxSizing:"border-box",resize:"vertical",overflow:"hidden",fontFamily:"inherit",
+    fontSize:"13px",lineHeight:"1.6",padding:"8px 10px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",
+    background:"var(--color-background-primary)",color:"var(--color-text-primary)"}, props.style||{})}/>;
+}
+const MATRIX_CSS = `
+.wm-mx{background:#fff;border:.5px solid #e5e7eb;border-radius:10px;padding:18px 20px 16px;margin-bottom:16px}
+.wm-mx-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding-bottom:10px;border-bottom:2px solid #1a1a2e;margin-bottom:12px}
+.wm-mx-head h3{margin:0;font-size:18px;font-weight:600;letter-spacing:-.2px;color:#1a1a2e}
+.wm-mx-actions{display:flex;align-items:center;gap:8px;flex:none}
+.wm-mx-max{font-size:11px;font-weight:700;letter-spacing:.04em;padding:5px 12px;border-radius:6px;background:#1a1a2e;color:#fff;white-space:nowrap}
+.wm-mx-sub{font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#1565C0;margin:0 0 4px}
+.wm-mx-text{font-size:13.5px;line-height:1.65;color:#1a1a2e;margin:0 0 14px;white-space:pre-wrap;max-width:none}
+.wm-mx-table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px;border:.5px solid #e5e7eb;border-radius:8px;overflow:hidden}
+.wm-mx-table th{background:#1a1a2e;color:#fff;text-align:left;font-weight:600;font-size:11.5px;letter-spacing:.04em;padding:9px 12px}
+.wm-mx-table td{vertical-align:middle;border-top:.5px solid #e5e7eb}
+.wm-mx-table td.lvl{color:#fff;font-weight:700;text-align:center;width:92px;padding:12px 8px;font-size:13px}
+.wm-mx-table td.pts{color:#fff;font-weight:700;text-align:center;width:52px;padding:12px 6px;font-size:13px}
+.wm-mx-table.editing td.pts,.wm-mx-table.editing th.pts{width:74px}
+.wm-mx-table.editing td.pts input{padding:5px 2px}
+.wm-mx-table td.def{padding:12px 14px;line-height:1.6;white-space:pre-wrap;color:#1a1a2e}
+.wm-mx-table tr:nth-child(even) td.def{background:#f9fafb}
+.wm-mx-table input{width:100%;box-sizing:border-box;font:inherit;font-size:13px;padding:5px 7px;border:.5px solid rgba(255,255,255,.6);border-radius:5px;background:rgba(255,255,255,.18);color:#fff;text-align:center}
+.wm-mx-table input::placeholder{color:rgba(255,255,255,.7)}
+.wm-mx-editlbl{font-size:12px;color:#6b7280;display:block;margin:0 0 4px}
+.wm-mx-bar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.wm-mx-dirty{font-size:11px;font-weight:600;padding:2px 9px;border-radius:999px;background:#fffbeb;color:#92400e;border:.5px solid #fde68a}
+`;
+
 function allTrue(arr){ var o={}; arr.forEach(function(k){ o[k]=true; }); return o; }
 
 // Reusable checkbox multi-select dropdown for the Fetch tab. Driven by a {value:true} map;
@@ -2016,8 +2165,10 @@ function FetchMultiSelect(props){
   var chosen=options.filter(function(o){return selected[o];});
   var total=options.length, n=chosen.length;
   var summary = n===0 ? "None" : (n===total ? "All" : (n===1 ? format(chosen[0]) : n+" selected"));
-  function setAll(v){ var m={}; if(v){ options.forEach(function(o){ m[o]=true; }); } onChange(m); }
-  function toggle(o){ var m=Object.assign({},selected); if(m[o]){ delete m[o]; } else { m[o]=true; } onChange(m); }
+  // v3.2.0 fix: the map always holds EVERY option (true/false). Before, "Clear" produced {} and ticking one value
+  // gave {X:true} — which the "active filter" checks read as "all selected", so the filter silently did nothing.
+  function setAll(v){ var m=Object.assign({},selected); options.forEach(function(o){ m[o]=!!v; }); onChange(m); }
+  function toggle(o){ var m=Object.assign({},selected); options.forEach(function(x){ if(!(x in m)) m[x]=false; }); m[o]=!m[o]; onChange(m); }
   return (
     <div style={{position:"relative"}} ref={sref}>
       <label style={{...lbl,marginBottom:"4px"}}>{label}</label>
@@ -2057,10 +2208,14 @@ function App() {
   const [tickets,setTickets]=useState([]);
   const [deletedTicketIds,setDeletedTicketIds]=useState(new Set());
   const [matrix,setMatrix]=useState(getDefaultMatrix());
+  const [matrixSnapshot,setMatrixSnapshot]=useState(null); // JSON of the last loaded/saved matrix+autofails+context, for "Unsaved changes"
+  const [matrixSnapPending,setMatrixSnapPending]=useState(false);
   const [matrixVersion,setMatrixVersion]=useState(null);   // config_history version of the loaded matrix
   const [migrationMode,setMigrationMode]=useState(false);  // true until Notion import is verified + cutover marked
   const [autofailList,setAutofailList]=useState(DEFAULT_AUTOFAILS);
   const [ctf,setCtf]=useState(makeDefaultCtf());
+  // Live CTF dropdown options from Gorgias (v3.2.0). Starts from the client fallback lists.
+  const [ctfFieldOpts,setCtfFieldOpts]=useState({source:"client-fallback",fields:{contactReason:CR_L1_OPTS.map(function(a){return a;}),product:[],resolution:[],addResolution:[]}});
   const [dataSetup,setDataSetup]=useState(null);
   const [syncing,setSyncing]=useState(false);
   const [syncStatus,setSyncStatus]=useState("");
@@ -2105,6 +2260,7 @@ function App() {
   const [navOpen,setNavOpen]=useState(false);        // mobile drawer
   const [userMenuOpen,setUserMenuOpen]=useState(false);
   const contentRef=useRef(null);
+  useEffect(function(){ if(matrixSnapPending){ setMatrixSnapshot(JSON.stringify({m:matrix,a:autofailList,c:scoringContext})); setMatrixSnapPending(false); } }, [matrixSnapPending, matrix, autofailList, scoringContext]);
   // New page -> start at the top (the content pane scrolls, not the window)
   useEffect(function(){ if (contentRef.current) contentRef.current.scrollTop = 0; }, [view]);
   // Close the account menu on Escape / outside click
@@ -2128,7 +2284,7 @@ function App() {
     channels:allTrue(CHANNEL_OPTS),
     agentFilter:"Has agent assigned",
     selectedAgents:{},
-    crL1:allTrue(CR_L1_OPTS),crL2:allTrue(CR_L2_OPTS),prodL1:"",resL1:"",resL2:"",addResL1:"",addResL2:"",
+    crL1:allTrue(CR_L1_OPTS),crL2:allTrue(CR_L2_OPTS),prodL1:"",resL1:{},resL2:{},addResL1:{},addResL2:{}, /* v3.2.0: resolution filters are multi-select maps (were free text) */
     msgMin:"",msgMax:"",agentMsgMin:"",
     ticketsPerAgent:"",maxTickets:"500",skipHours:"24",
     keyword:"",
@@ -2143,6 +2299,8 @@ function App() {
   const [fetchedTickets,setFetchedTickets]=useState([]);
   // ── Fetch v2 (warehouse-selected ticket IDs) ──
   const [v2Week,setV2Week]=useState("");
+  // Batch Fetch priority filters (v3.2.0) — same multi-select maps as Search Tickets; {} = "All"
+  const [v2Filters,setV2Filters]=useState({crL1:{},crL2:{},resL1:{},resL2:{},addResL1:{},addResL2:{}});
   const [v2Target,setV2Target]=useState("6");
   const [v2MinAgentMsg,setV2MinAgentMsg]=useState("4");
   const [v2FloorAgentMsg,setV2FloorAgentMsg]=useState("2");
@@ -2165,7 +2323,11 @@ function App() {
   },[showAgentDropdown]);
 
   // Manual Audit tab
-  const [manualForm,setManualForm]=useState({ticketId:"",agentName:"",contactReason:"",ticketUrl:"",customerEmail:"",week:"",transcript:""});
+  // Manual Audit (v3.2.0): one input — the ticket ID; everything else loads from Gorgias
+  const [manualTicketId,setManualTicketId]=useState("");
+  const [manualLoaded,setManualLoaded]=useState(null);       // {ticket, warnings[], alreadyAudited, noTranscript}
+  const [manualLoading,setManualLoading]=useState(false);
+  const [manualAgentOverride,setManualAgentOverride]=useState(""); // only when Gorgias has no assignee
   const [manualRunning,setManualRunning]=useState(false);
   const [manualResult,setManualResult]=useState(null);
   const [manualStatus,setManualStatus]=useState("");
@@ -4690,10 +4852,11 @@ Rules:
           if(crL1Active && !crL1Sel.includes(crParts[0].toLowerCase())) { fc.skippedCR++; fdbg(tid,"SKIP contact-reason-L1: '"+crParts[0]+"' not in selected"); continue; }
           if(crL2Active && !crL2Sel.includes(crParts[1].toLowerCase())) { fc.skippedCR++; fdbg(tid,"SKIP contact-reason-L2: '"+crParts[1]+"' not in selected"); continue; }
           if(f.prodL1 && prodParts[0].toLowerCase() !== f.prodL1.toLowerCase()) { fc.skippedCR++; fdbg(tid,"SKIP product-L1: '"+prodParts[0]+"' != '"+f.prodL1+"'"); continue; }
-          if(f.resL1 && resParts[0].toLowerCase() !== f.resL1.toLowerCase()) { fc.skippedRes++; fdbg(tid,"SKIP resolution-L1: '"+resParts[0]+"' != '"+f.resL1+"'"); continue; }
-          if(f.resL2 && f.resL2.trim() && resParts[1].toLowerCase() !== f.resL2.trim().toLowerCase()) { fc.skippedRes++; fdbg(tid,"SKIP resolution-L2: '"+resParts[1]+"' != '"+f.resL2+"'"); continue; }
-          if(f.addResL1 && addResParts[0].toLowerCase() !== f.addResL1.toLowerCase()) { fc.skippedRes++; fdbg(tid,"SKIP add-resolution-L1: '"+addResParts[0]+"' != '"+f.addResL1+"'"); continue; }
-          if(f.addResL2 && f.addResL2.trim() && addResParts[1].toLowerCase() !== f.addResL2.trim().toLowerCase()) { fc.skippedRes++; fdbg(tid,"SKIP add-resolution-L2: '"+addResParts[1]+"' != '"+f.addResL2+"'"); continue; }
+          // v3.2.0: resolution filters are multi-selects (any selected value matches); "All"/none = no filter
+          if(selIsActive(f.resL1) && selValuesLower(f.resL1).indexOf(resParts[0].toLowerCase().trim())===-1) { fc.skippedRes++; fdbg(tid,"SKIP resolution-L1: '"+resParts[0]+"' not in selected"); continue; }
+          if(selIsActive(f.resL2) && selValuesLower(f.resL2).indexOf(resParts[1].toLowerCase().trim())===-1) { fc.skippedRes++; fdbg(tid,"SKIP resolution-L2: '"+resParts[1]+"' not in selected"); continue; }
+          if(selIsActive(f.addResL1) && selValuesLower(f.addResL1).indexOf(addResParts[0].toLowerCase().trim())===-1) { fc.skippedRes++; fdbg(tid,"SKIP add-resolution-L1: '"+addResParts[0]+"' not in selected"); continue; }
+          if(selIsActive(f.addResL2) && selValuesLower(f.addResL2).indexOf(addResParts[1].toLowerCase().trim())===-1) { fc.skippedRes++; fdbg(tid,"SKIP add-resolution-L2: '"+addResParts[1]+"' not in selected"); continue; }
 
           if(deletedTicketIds.has(String(tid))) { fc.skippedDeleted++; fdbg(tid,"SKIP previously-deleted"); continue; }
 
@@ -4826,7 +4989,7 @@ Rules:
 
   function downloadFetchedCSV() {
     if(!fetchedTickets.length) return;
-    var keys = Object.keys(fetchedTickets[0]);
+    var keys = Object.keys(fetchedTickets[0]).filter(function(k){ return k.charAt(0)!=="_"; }); // skip internal "_" fields
     var rows = [keys.join(",")].concat(fetchedTickets.map(function(r){
       return keys.map(function(k){
         var v = String(r[k]||"").replace(/"/g,'""');
@@ -4872,8 +5035,15 @@ Rules:
     var floor = parseInt(v2FloorAgentMsg||"2")||2;
     var exclEmails = excludedAgentEmails().map(function(e){return "'"+e.replace(/'/g,"\\'")+"'";}).join(", ");
     if(!exclEmails) exclEmails = "''"; // no-op IN() list
+    var v2Active = v2ActiveFilters(v2Filters);
+    var ctfSql = v2CtfSql(v2Active, d(start), d(end));
+    var filterNote = v2Active.length
+      ? "-- Priority filters (closest matches first, then top-up from near misses):\n"
+        + v2Active.map(function(a){ return "--   "+a.label+" = "+selChosen(v2Filters[a.key]).join(" | "); }).join("\n")+"\n"
+      : "";
     return "-- Wingman Fetch v2 — "+mnlWeekLabel(mon)+"\n"
-      +"-- Top "+target+" tickets per agent, ranked by assigned-agent public replies (floor "+floor+").\n"
+      +"-- Top "+target+" tickets per agent, ranked by "+(v2Active.length?"filter mismatch, then ":"")+"assigned-agent public replies (floor "+floor+").\n"
+      +filterNote
       +"WITH per_ticket AS (\n"
       +"  SELECT\n"
       +"    t.ticket_id,\n"
@@ -4891,10 +5061,11 @@ Rules:
       +"    AND t.assignee_user_id IS NOT NULL\n"
       +"  GROUP BY 1, 2\n"
       +"),\n"
+      +ctfSql.ctes
       +"ranked AS (\n"
       +"  SELECT p.*, u.name AS agent_name,\n"
-      +"    ROW_NUMBER() OVER (PARTITION BY p.assignee_user_id ORDER BY p.agent_msgs DESC, p.ticket_id DESC) AS rn\n"
-      +"  FROM per_ticket AS p\n"
+      +"    ROW_NUMBER() OVER (PARTITION BY p.assignee_user_id ORDER BY "+(v2Active.length?"p.mismatch ASC, ":"")+"p.agent_msgs DESC, p.ticket_id DESC) AS rn\n"
+      +"  FROM "+ctfSql.source+" AS p\n"
       +"  LEFT JOIN gaia.users AS u ON u.gorgias_user_id = p.assignee_user_id\n"
       +"  WHERE p.agent_msgs >= "+floor+"\n"
       +"    AND LOWER(COALESCE(u.email, '')) NOT IN ("+exclEmails+")\n"
@@ -4903,7 +5074,7 @@ Rules:
       +"SELECT STRING_AGG(CAST(ticket_id AS STRING), ',' ORDER BY agent_name) AS ticket_ids\n"
       +"FROM ranked WHERE rn <= "+target+";\n"
       +"-- Swap the final SELECT for this to eyeball it first:\n"
-      +"-- SELECT agent_name, ticket_id, agent_msgs FROM ranked WHERE rn <= "+target+" ORDER BY agent_name, agent_msgs DESC;";
+      +"-- SELECT agent_name, ticket_id, agent_msgs"+(v2Active.length?", mismatch":"")+" FROM ranked WHERE rn <= "+target+" ORDER BY agent_name, "+(v2Active.length?"mismatch, ":"")+"agent_msgs DESC;";
   }
 
   function parseV2Ids(raw) {
@@ -4925,6 +5096,7 @@ Rules:
     if(ids.length > 600 && !window.confirm(ids.length+" ticket IDs — that's a large run. Continue?")) return;
 
     setV2Running(true); v2StopRef.current = false; setV2Summary(null);
+    var v2Active = v2ActiveFilters(v2Filters);   // priority filters, re-checked on LIVE tags below
     var fc = { requested: ids.length, fetched:0, skippedDeleted:0, skippedAudited:0,
                skippedExcludedAgent:0, skippedNoTranscript:0, errors:0, rateLimited:false };
     var results = [];
@@ -4981,8 +5153,10 @@ Rules:
         var crP = parseTicketField(t, FIELD_CR), prP = parseTicketField(t, FIELD_PROD),
             rsP = parseTicketField(t, FIELD_RES), adP = parseTicketField(t, FIELD_ADDRES);
         var createdFmt = (t.created_datetime||"").slice(0,10);
+        var missed = v2Active.length ? v2TicketMismatch(v2Active, {cr:crP, res:rsP, addres:adP}) : [];
 
         results.push({
+          _v2Missed:                missed,   // priority-filter misses (for the run summary only; not saved)
           ticket_id:                String(tid),
           ticket_url:               "https://"+((window.__ENV__&&window.__ENV__.GORGIAS_DOMAIN)||"freedomgrooming.gorgias.com")+"/app/ticket/"+tid,
           subject:                  t.subject || "(no subject)",
@@ -5009,6 +5183,23 @@ Rules:
     }
 
     fc.result = results.length;
+    if(v2Active.length){
+      // Priority summary: per agent, how many picks matched every filter vs. were near-miss top-ups
+      var byAgent = {}, missCount = {};
+      results.forEach(function(r){
+        var a = r.agent||"(no agent)", n = (r._v2Missed||[]).length;
+        var row = byAgent[a] || (byAgent[a] = {agent:a, total:0, exact:0, off1:0, off2:0});
+        row.total++; if(n===0) row.exact++; else if(n===1) row.off1++; else row.off2++;
+        (r._v2Missed||[]).forEach(function(l){ missCount[l]=(missCount[l]||0)+1; });
+      });
+      fc.priority = {
+        filters: v2Active.map(function(a){ return {label:a.label, values:selChosen(v2Filters[a.key])}; }),
+        target: parseInt(v2Target||"6")||6,
+        agents: Object.values(byAgent).sort(function(x,y){ return x.agent.localeCompare(y.agent); }),
+        exact: results.filter(function(r){return !(r._v2Missed||[]).length;}).length,
+        topMisses: Object.entries(missCount).sort(function(x,y){return y[1]-x[1];})
+      };
+    }
     setFetchedTickets(results);
     setV2Summary(fc);
     setV2Running(false);
@@ -5041,61 +5232,100 @@ Rules:
       : ("Loaded "+mapped.length+" tickets into "+UI_LABELS.batch+" — ready to score")); // UI label (was "Batch QA")
   }
 
-  // ── MANUAL AUDIT ─────────────────────────────────────────────────────────────
-  async function runManualAudit() {
-    if(!manualForm.ticketId.trim()||!manualForm.agentName||!manualForm.transcript.trim()) {
-      addToast("Ticket ID, Agent and Transcript are required","error"); return;
+  // ── MANUAL AUDIT (v3.2.0) ────────────────────────────────────────────────────
+  // One input: the ticket ID. "Load from Gorgias" pulls the ticket + messages the same way Batch Fetch
+  // does, and scoring uses the SAME prompt and result shape as AI Audit (buildEvalPrompt / calcScore),
+  // so a manual audit is graded exactly like a batch audit — CTF tags, scoring context and autofails
+  // included. The pre-v3.2.0 manual prompt only saw a free-text contact reason.
+  async function gorgiasGetWithBackoff(path, params, label){
+    var waits=[5000,10000,20000,40000];
+    for(var a=0;a<=waits.length;a++){
+      var r = await gorgiasAPI(path, params);
+      if(!(r && r._status===429)) return r;
+      if(a===waits.length) break;
+      setManualStatus("Gorgias rate limit — retrying "+label+" in "+(waits[a]/1000)+"s…");
+      await new Promise(function(res){setTimeout(res,waits[a]);});
     }
-    setManualRunning(true); setManualResult(null); setManualStatus("Scoring ticket with AI...");
-    try {
-      // Build prompt identical to batch QA
-      var justSchema=matrix.map(function(c){return '"'+c.id+'":{reason:"",improve:""}';}).join(",");
-      var scoreOptions=matrix.map(function(c){return c.id+": "+c.levels.map(function(l){return l.level+(l.points!==null?" ("+l.points+")":"");}).join("/");}).join("; ");
-      var prompt = "You are a QA analyst for Freedom Grooming customer support. Score this ticket against the rubric. Respond in English only.\n\nSCORING: "+scoreOptions+".\nUse NA if category doesn't apply.\n\n"
-        +"AUTOFAIL CONDITIONS:\n1. Failing to complete promised resolution\n2. Wrong account-level action\n3. Financial/operational risk through incorrect workflow\n4. Materially inaccurate policy info\n5. Tone that materially worsens risk\n\n"
-        +"TICKET INFO:\nAgent: "+manualForm.agentName+"\nContact Reason: "+(manualForm.contactReason||"Unknown")+"\n\n"
-        +"TRANSCRIPT:\\n"+manualForm.transcript+"\\n\\n"
-        +"Respond ONLY with valid JSON matching exactly:\n{"
-        +'"scores":{'+matrix.map(function(c){return '"'+c.id+'":"YES/PARTIAL/NO/NA (points)"';}).join(",")+'},'
-        +'"justifications":{'+justSchema+'},'
-        +'"autofails":[],'
-        +'"comments":"+ [key strength observation]\n- [key improvement observation]"}';
-
-      var result = await callClaudeWithRetry(prompt);
-      var parsed = tryParseJSON(result);
-      if(!parsed||!parsed.scores){addToast("AI scoring failed — invalid response","error");setManualRunning(false);setManualStatus("");return;}
-
-      var aiScores=parsed.scores||{};
-      var justifications=parsed.justifications||{};
-      var autofailsList=parsed.autofails||[];
-      var comments=parsed.comments||"";
-
-      // Calculate score
-      var pts=0,mx=0;
-      matrix.forEach(function(c){var v=aiScores[c.id]||"";if(!v||v.toUpperCase()==="NA")return;var m=String(v).match(/\(([\d.]+)\)/);if(m){pts+=parseFloat(m[1]);mx+=c['max'];}});
-      var aiScore=mx>0?Math.round(pts/mx*100):0;
-      var passed=aiScore>=PASS_THRESHOLD;
-      var autofail=autofailsList.length>0;
-      var now=new Date().toISOString();
-      var week=manualForm.week||"Manual - "+now.slice(0,10);
-
-      var ticket={
-        ticketId:manualForm.ticketId.trim(), agentName:manualForm.agentName, reviewer:currentUser.name,
-        contactReason:manualForm.contactReason, ticketUrl:manualForm.ticketUrl, week:week,
-        transcript:manualForm.transcript, aiScore, finalScore:aiScore, passed, autofail,
-        aiScores, scores:aiScores, justifications, autofails:autofailsList, comments,
-        disputes:{}, hasDisputes:false, createdDate:"", auditType:"Manual", savedAt:now,
+    throw new Error("Gorgias kept rate-limiting — try again in a minute");
+  }
+  async function loadManualFromGorgias(){
+    var tid = String(manualTicketId||"").replace(/[^0-9]/g,"");
+    if(!tid){ addToast("Enter a Gorgias ticket ID","error"); return; }
+    setManualLoading(true); setManualLoaded(null); setManualResult(null); setManualAgentOverride(""); setManualStatus("Loading #"+tid+" from Gorgias…");
+    try{
+      var t = await gorgiasGetWithBackoff("/tickets/"+tid, null, "ticket");
+      if(!t || t.error || !t.id) throw new Error("Ticket #"+tid+" not found in Gorgias");
+      var agentName="", agentId=null, agentEmail="";
+      if(t.assignee_user){ var au=t.assignee_user;
+        agentName = normalizeAgentName(au.name || ((au.firstname||"")+" "+(au.lastname||"")).trim());
+        agentId = au.id!=null ? String(au.id) : null; agentEmail = (au.email||"").toLowerCase().trim(); }
+      setManualStatus("Loading messages…");
+      var mr = await gorgiasGetWithBackoff("/tickets/"+tid+"/messages", {limit:100}, "messages");
+      var msgs = (mr && mr.data) || [];
+      var transcript = buildTranscript(msgs);
+      var crP=parseTicketField(t,FIELD_CR), prP=parseTicketField(t,FIELD_PROD), rsP=parseTicketField(t,FIELD_RES), adP=parseTicketField(t,FIELD_ADDRES);
+      var row = {
+        ticket_id: String(tid),
+        ticket_url: "https://"+((window.__ENV__&&window.__ENV__.GORGIAS_DOMAIN)||"freedomgrooming.gorgias.com")+"/app/ticket/"+tid,
+        subject: t.subject||"(no subject)", status: t.status||"", initial_channel: t.channel||t.via||"",
+        created_date: (t.created_datetime||"").slice(0,10), closed_date: (t.closed_datetime||"").slice(0,10),
+        agent: agentName, customer_email: (t.customer&&t.customer.email)||"",
+        contact_reason_l1: crP[0], contact_reason_l2: crP[1], product_l1: prP[0], product_l2: prP[1],
+        ticket_resolution_l1: rsP[0], ticket_resolution_l2: rsP[1], additional_resolution_l1: adP[0], additional_resolution_l2: adP[1],
+        message_count: msgs.length, agent_message_count: countAssignedAgentMessages(msgs, agentId, agentName), transcript: transcript
       };
-
-      setManualStatus("Saving...");
-      var saved=await saveTicketToDb(ticket);
-      ticket.rowId=saved.id; ticket.id=saved.id;
-      setTickets(function(ts){return [parseTicketRow(Object.assign({pageId:saved.id},ticket))].concat(ts);});
-      setManualResult(ticket);
-      addToast("Manual audit saved — "+aiScore+"%");
-    } catch(e){addToast("Error: "+e.message,"error");}
+      var mapped = mapRow(row);
+      var warnings = [];
+      if(!transcript || transcript.trim().length<20) warnings.push("No usable transcript on this ticket — it can't be scored.");
+      if(!agentName) warnings.push("No agent is assigned in Gorgias — pick the agent below.");
+      if(agentName && isExcludedAssignee(agentEmail, agentName)) warnings.push(agentName+" is flagged “Exclude Their Tickets”. Batch runs skip them; you can still audit manually.");
+      var prior = (tickets||[]).filter(function(x){ return String(x.ticketId)===String(tid) && !x.deleted; });
+      if(prior.length) warnings.push("Already audited ("+prior.length+"×, latest by "+(prior[0].reviewer||"?")+"). Running again adds another audit.");
+      if(deletedTicketIds.has(String(tid))) warnings.push("A previous audit of this ticket was deleted.");
+      setManualLoaded({ticket:mapped, warnings:warnings, alreadyAudited:prior.length>0, noTranscript:!transcript||transcript.trim().length<20});
+      setManualStatus("");
+    } catch(e){ setManualStatus(""); addToast(e.message,"error"); }
+    setManualLoading(false);
+  }
+  async function runManualAudit() {
+    if(!manualLoaded || manualLoaded.noTranscript) return;
+    var ticket = Object.assign({}, manualLoaded.ticket);
+    if(!ticket.agentName) ticket.agentName = manualAgentOverride;
+    if(!ticket.agentName){ addToast("Pick the agent first","error"); return; }
+    if(manualLoaded.alreadyAudited && !window.confirm("Ticket #"+ticket.ticketId+" was already audited. Add another audit?")) return;
+    setManualRunning(true); setManualResult(null); setManualStatus("Scoring with AI (same rubric as "+UI_LABELS.batch+")…");
+    try {
+      var rawTxt = await callClaudeWithRetry(buildEvalPrompt(ticket));
+      var cleanTxt = rawTxt.replace(/```(?:json)?\s*/g,"").replace(/```/g,"").trim();
+      var jsonMatch = cleanTxt.match(/\{[\s\S]+\}/);
+      if(!jsonMatch) throw new Error("AI scoring failed — no JSON in response");
+      var parsed = JSON.parse(jsonMatch[0]);
+      var sc = calcScore(parsed.scores||{}, matrix);
+      var hasAF = (parsed.autofails||[]).length>0;
+      // Same shape as an AI Audit result (see runBatchQA) — only auditType differs
+      var result = {
+        week: ticketWeekLabel(ticket.createdDate)||week, auditWeek: week,
+        reviewer: currentUser.name, agentName: ticket.agentName, ticketId: String(ticket.ticketId), ticketUrl: ticket.ticketUrl,
+        createdDate: ticket.createdDate||"", contactReason: (parsed.meta&&parsed.meta.contactReason)||ticket.contactReason,
+        product: (parsed.meta&&parsed.meta.product)||"", ticketResolution: (parsed.meta&&parsed.meta.ticketResolution)||"",
+        scores: parsed.scores||{}, aiScores: parsed.scores||{}, autofails: parsed.autofails||[], autofail: hasAF,
+        comments: parsed.comments||"", totalPoints: sc?sc.pts:0, maxPoints: sc?sc.max:0,
+        finalScore: sc?sc.pct:0, aiScore: sc?sc.pct:0, passed: !hasAF&&(sc?sc.pct:0)>=85,
+        hasDisputes: false, disputes: {}, justifications: parsed.justifications||{},
+        customerEmail: ticket.customerEmail, savedAt: new Date().toISOString(), transcript: ticket.transcript||"",
+        messageCount: ticket.messageCount||0, agentMessageCount: ticket.agentMessageCount||0,
+        ctfAsScored: pickCtfTags(ticket), auditType: "Manual",
+      };
+      setManualStatus("Saving…");
+      var saved = await saveTicketToDb(result);
+      result.rowId = saved.id; result.id = saved.id;
+      setTickets(function(ts){ return [parseTicketRow(Object.assign({pageId:saved.id}, result))].concat(ts); });
+      setManualResult(result);
+      addToast("Manual audit saved — "+result.aiScore+"%");
+    } catch(e){ addToast("Error: "+e.message,"error"); }
     setManualRunning(false); setManualStatus("");
   }
+  function resetManualAudit(){ setManualTicketId(""); setManualLoaded(null); setManualResult(null); setManualAgentOverride(""); setManualStatus(""); }
 
   // ── CALIBRATION ───────────────────────────────────────────────────────────────
   async function runCalibration() {
@@ -5546,8 +5776,26 @@ Rules:
     downloadBlob(html, "Wingman_TeamCalibration_"+week.replace(/[^a-zA-Z0-9]/g,"_")+".doc", "application/msword");
   }
 
+  // Live CTF dropdown options (v3.2.0). Non-blocking; filters keep working on fallback lists meanwhile.
+  async function loadCtfFieldOptions(){
+    try {
+      var d = await apiCall("/gorgias/fields");
+      if(!d || !d.fields) return;
+      setCtfFieldOpts(d);
+      var cr = d.fields.contactReason||[], rs = d.fields.resolution||[], ad = d.fields.addResolution||[];
+      var rebase = function(f){ return Object.assign({}, f, {
+        crL1: selRebase(f.crL1, ctfL1List(cr)), crL2: selRebase(f.crL2, ctfL2List(cr)),
+        resL1: selRebase(f.resL1, ctfL1List(rs)), resL2: selRebase(f.resL2, ctfL2List(rs)),
+        addResL1: selRebase(f.addResL1, ctfL1List(ad)), addResL2: selRebase(f.addResL2, ctfL2List(ad)) }); };
+      setFetchForm(rebase);
+      setV2Filters(rebase);
+      if(d.source!=="live") dbg("fields","CTF options from "+d.source+": "+(d.error||""));
+    } catch(e){ dbg("fields","CTF options unavailable: "+e.message); }
+  }
+
   async function loadAllData(setup) {
     setLoading(true);
+    loadCtfFieldOptions();
     setSyncStatus("Loading tickets from database...");
     try {
       const t = await loadTicketsFromDb(setSyncStatus);
@@ -5574,6 +5822,7 @@ Rules:
       if(savedAutofails && Array.isArray(savedAutofails)) setAutofailList(savedAutofails);
       var savedScoringContext = await loadConfigFromDb("scoringContext");
       if(savedScoringContext && typeof savedScoringContext === "string") setScoringContext(savedScoringContext);
+      setMatrixSnapPending(true);   // snapshot the loaded matrix once state has committed (see effect)
       var savedBaseline = await loadConfigFromDb("calibrationBaseline");
       if(savedBaseline && typeof savedBaseline === "string") setCalibrationBaseline(savedBaseline);
       setSyncStatus("");
@@ -5610,12 +5859,13 @@ Rules:
   }
 
   async function saveMatrix() {
-    if (!dataSetup || !isEditor) { addToast("Editor access required", "error"); return; }
+    if (!dataSetup || !isFullAccess) { addToast("Only Full users can edit the matrix", "error"); return; } // v3.2.0: Full only (server enforces too)
     try {
       var mv = await saveConfigToDb("matrix", matrix);
       await saveConfigToDb("autofails", autofailList);
       await saveConfigToDb("scoringContext", scoringContext);
       setMatrixVersion(mv);
+      setMatrixSnapshot(JSON.stringify({m:matrix,a:autofailList,c:scoringContext}));
       setMatrixSaved(true); setTimeout(() => setMatrixSaved(false), 2000);
       addToast("Matrix saved (v"+mv+")");
     } catch(e) { addToast("Save error: " + e.message, "error"); }
@@ -6018,7 +6268,7 @@ Rules:
       {migrationMode&&(
         <div style={{background:"var(--color-background-warning)",color:"var(--color-text-warning)",border:"0.5px solid var(--color-border-warning)",borderRadius:"var(--border-radius-md)",padding:"10px 14px",fontSize:"12px",marginBottom:"18px",display:"flex",justifyContent:"space-between",alignItems:"center",gap:"12px",flexWrap:"wrap"}}>
           <span><strong>Migration mode — read-only.</strong> Import from Notion, verify, then mark cutover complete. Other users can't sign in until then.</span>
-          <button onClick={function(){navGo("settings");setSettingsTab("access");}} style={{...ghost,fontSize:"11px"}}>Settings › Database</button>
+          <button onClick={function(){navGo("settings");setSettingsTab("admin");}} style={{...ghost,fontSize:"11px"}}>Settings › Admin Tools</button>
         </div>
       )}
 
@@ -6858,12 +7108,8 @@ Rules:
         <div>
           <div style={{...card,marginBottom:"16px"}}>
 
-            {/* Header */}
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:"18px"}}>
-              <div>
-                <p style={{margin:"0 0 2px",fontSize:"15px",fontWeight:600}}>Fetch Tickets from Gorgias</p>
-                <p style={{margin:0,fontSize:"12px",color:"var(--color-text-secondary)"}}>Pull tickets from Gorgias, preview, then save as CSV or run QA.</p>
-              </div>
+            {/* Header — v3.2.0: title/description come from the page header (UI_LABELS / UI_LEDES); only the config warning stays */}
+            <div style={{display:"flex",justifyContent:"flex-end",alignItems:"flex-start",marginBottom:(window.__ENV__&&window.__ENV__.GORGIAS_CONFIGURED)?"0":"18px"}}>
               {!(window.__ENV__&&window.__ENV__.GORGIAS_CONFIGURED)&&(
                 <div style={{fontSize:"12px",color:"var(--color-text-warning)",padding:"6px 12px",background:"var(--color-background-warning)",borderRadius:"var(--border-radius-md)",border:"0.5px solid var(--color-border-warning)"}}>
                   ⚠ Gorgias not configured
@@ -6983,13 +7229,13 @@ Rules:
               </div>
               <div>
                 <FetchMultiSelect label="Contact Reason L1"
-                  options={CR_L1_OPTS}
+                  options={ctfL1List(ctfFieldOpts.fields.contactReason)} /* live Gorgias options (v3.2.0) */
                   selected={fetchForm.crL1}
                   onChange={function(m){setFetchForm(function(f){return Object.assign({},f,{crL1:m});});}}/>
               </div>
               <div>
                 <FetchMultiSelect label="Contact Reason L2"
-                  options={CR_L2_OPTS}
+                  options={ctfL2List(ctfFieldOpts.fields.contactReason, selIsActive(fetchForm.crL1)?selChosen(fetchForm.crL1):null)}
                   selected={fetchForm.crL2}
                   onChange={function(m){setFetchForm(function(f){return Object.assign({},f,{crL2:m});});}}/>
               </div>
@@ -7026,35 +7272,20 @@ Rules:
                 style={{background:"none",border:"none",cursor:"pointer",padding:0,display:"flex",alignItems:"center",gap:"6px",color:"var(--color-text-secondary)",fontSize:"12px"}}>
                 <span style={{fontSize:"10px"}}>{showAdvancedFetch?"▾":"▸"}</span>
                 Advanced filters
-                {(fetchForm.resL1||fetchForm.resL2||fetchForm.addResL1||fetchForm.addResL2||fetchForm.keyword||fetchForm.msgMin||fetchForm.msgMax||fetchForm.agentMsgMin)&&<span style={{fontSize:"10px",padding:"1px 5px",background:"var(--color-background-info)",color:"var(--color-text-info)",borderRadius:"3px",border:"0.5px solid var(--color-border-info)"}}>active</span>}
+                {(selIsActive(fetchForm.resL1)||selIsActive(fetchForm.resL2)||selIsActive(fetchForm.addResL1)||selIsActive(fetchForm.addResL2)||fetchForm.keyword||fetchForm.msgMin||fetchForm.msgMax||fetchForm.agentMsgMin)&&<span style={{fontSize:"10px",padding:"1px 5px",background:"var(--color-background-info)",color:"var(--color-text-info)",borderRadius:"3px",border:"0.5px solid var(--color-border-info)"}}>active</span>}
               </button>
               {showAdvancedFetch&&(
                 <div style={{marginTop:"12px",padding:"14px",background:"var(--color-background-secondary)",borderRadius:"var(--border-radius-md)",border:"0.5px solid var(--color-border-tertiary)"}}>
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:"10px",marginBottom:"12px"}}>
-                    <div>
-                      <label style={{...lbl,marginBottom:"4px"}}>Resolution L1</label>
-                      <input type="text" placeholder="e.g. Refund Issued" value={fetchForm.resL1}
-                        onChange={function(e){setFetchForm(function(f){return Object.assign({},f,{resL1:e.target.value});});}}
-                        style={{width:"100%",boxSizing:"border-box",fontSize:"12px",padding:"6px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/>
-                    </div>
-                    <div>
-                      <label style={{...lbl,marginBottom:"4px"}}>Resolution L2</label>
-                      <input type="text" placeholder="e.g. Full Refund" value={fetchForm.resL2}
-                        onChange={function(e){setFetchForm(function(f){return Object.assign({},f,{resL2:e.target.value});});}}
-                        style={{width:"100%",boxSizing:"border-box",fontSize:"12px",padding:"6px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/>
-                    </div>
-                    <div>
-                      <label style={{...lbl,marginBottom:"4px"}}>Add. Resolution L1</label>
-                      <input type="text" placeholder="e.g. Replacement" value={fetchForm.addResL1}
-                        onChange={function(e){setFetchForm(function(f){return Object.assign({},f,{addResL1:e.target.value});});}}
-                        style={{width:"100%",boxSizing:"border-box",fontSize:"12px",padding:"6px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/>
-                    </div>
-                    <div>
-                      <label style={{...lbl,marginBottom:"4px"}}>Add. Resolution L2</label>
-                      <input type="text" placeholder="e.g. Blade Refill" value={fetchForm.addResL2}
-                        onChange={function(e){setFetchForm(function(f){return Object.assign({},f,{addResL2:e.target.value});});}}
-                        style={{width:"100%",boxSizing:"border-box",fontSize:"12px",padding:"6px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/>
-                    </div>
+                    {/* v3.2.0: live Gorgias options, multi-select; L2 lists narrow to the L1s picked */}
+                    <div><FetchMultiSelect label="Resolution L1" options={ctfL1List(ctfFieldOpts.fields.resolution)} selected={fetchForm.resL1}
+                      onChange={function(m){setFetchForm(function(f){return Object.assign({},f,{resL1:m});});}}/></div>
+                    <div><FetchMultiSelect label="Resolution L2" options={ctfL2List(ctfFieldOpts.fields.resolution, selIsActive(fetchForm.resL1)?selChosen(fetchForm.resL1):null)} selected={fetchForm.resL2}
+                      onChange={function(m){setFetchForm(function(f){return Object.assign({},f,{resL2:m});});}}/></div>
+                    <div><FetchMultiSelect label="Add. Resolution L1" options={ctfL1List(ctfFieldOpts.fields.addResolution)} selected={fetchForm.addResL1}
+                      onChange={function(m){setFetchForm(function(f){return Object.assign({},f,{addResL1:m});});}}/></div>
+                    <div><FetchMultiSelect label="Add. Resolution L2" options={ctfL2List(ctfFieldOpts.fields.addResolution, selIsActive(fetchForm.addResL1)?selChosen(fetchForm.addResL1):null)} selected={fetchForm.addResL2}
+                      onChange={function(m){setFetchForm(function(f){return Object.assign({},f,{addResL2:m});});}}/></div>
                   </div>
                   <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr",gap:"10px"}}>
                     <div>
@@ -7210,14 +7441,7 @@ Rules:
       {/* ── FETCH V2 TAB (warehouse-selected) ── */}
       {view==="fetchv2"&&isEditor&&(
         <div>
-          <div style={{...card,marginBottom:"16px"}}>
-            <p style={{margin:"0 0 2px",fontSize:"15px",fontWeight:600}}>{UI_LABELS.fetchv2} — warehouse-selected</p>{/* UI label (was "Fetch v2") */}
-            <p style={{margin:0,fontSize:"12px",color:"var(--color-text-secondary)"}}>
-              Let the Gorgias analytics warehouse pick the tickets, then fetch only those. It works out the tiered fallback
-              (target at your minimum, topping up from lower tiers) in one query, instead of you re-running Fetch at 4, then 3, then 2.
-              <strong> Fetch Tickets is untouched and remains the fallback.</strong>
-            </p>
-          </div>
+          {/* v3.2.0: intro card removed — the page header (UI_LEDES.fetchv2) describes the page */}
 
           <div style={{...card,marginBottom:"16px"}}>
             <p style={{...sectionLabel,marginBottom:"10px"}}>Step 1 — Generate the query</p>
@@ -7248,6 +7472,26 @@ Rules:
                 navigator.clipboard.writeText(sql).then(function(){ addToast("SQL copied — paste it to Claude with Gorgias connected"); },
                   function(){ addToast("Couldn't copy — select it below manually","error"); });
               }} disabled={!v2Week} style={{...btnInfo,opacity:!v2Week?0.5:1}}>Copy SQL</button>
+            </div>
+            {/* Priority filters (v3.2.0) */}
+            <div style={{margin:"4px 0 12px",padding:"12px",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-md)"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",gap:"8px",flexWrap:"wrap",marginBottom:"8px"}}>
+                <span style={{fontSize:"12px",fontWeight:600}}>Priority filters <span style={{fontWeight:400,color:"var(--color-text-secondary)"}}>— optional</span></span>
+                {v2ActiveFilters(v2Filters).length>0&&<button onClick={function(){setV2Filters(function(f){var o={};Object.keys(f).forEach(function(k){o[k]=allTrue(Object.keys(f[k]||{}));});return o;});}} style={{...ghost,fontSize:"11px",padding:"3px 10px"}}>Clear filters</button>}
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(170px,1fr))",gap:"10px"}}>
+                {V2_FILTER_DEFS.map(function(d){
+                  var choices = ctfFieldOpts.fields[d.opts]||[];
+                  var l1Key = d.key.replace("L2","L1");
+                  var opts = d.part===0 ? ctfL1List(choices) : ctfL2List(choices, selIsActive(v2Filters[l1Key])?selChosen(v2Filters[l1Key]):null);
+                  return <div key={d.key}><FetchMultiSelect label={d.label} options={opts} selected={v2Filters[d.key]}
+                    onChange={function(m){setV2Filters(function(f){var o=Object.assign({},f);o[d.key]=m;return o;});}}/></div>;
+                })}
+              </div>
+              <p style={{fontSize:"11px",color:"var(--color-text-secondary)",margin:"8px 0 0",lineHeight:"1.5"}}>
+                Filters set priority, not hard limits: each agent is filled with tickets matching every filter first. If an agent
+                runs short, the gap is topped up with the closest matches (fewest filters missed). The run summary shows the split.
+              </p>
             </div>
             <p style={{fontSize:"11px",color:"var(--color-text-secondary)",margin:"0 0 8px"}}>
               Ranks each agent's tickets by assigned-agent public replies (internal notes and bot messages excluded) and takes the top N — so agents who
@@ -7304,6 +7548,33 @@ Rules:
                     <strong style={r.color?{color:r.color}:{}}>{r.val}</strong></div>;
                 })}
               </div>
+              {v2Summary.priority&&(
+                <div style={{marginTop:"14px",paddingTop:"12px",borderTop:"0.5px solid var(--color-border-tertiary)"}}>
+                  <p style={{fontSize:"12px",margin:"0 0 4px"}}><strong>Priority filters:</strong> {v2Summary.priority.filters.map(function(f){return f.label+" = "+f.values.join(" | ");}).join("; ")}</p>
+                  <p style={{fontSize:"12px",margin:"0 0 10px",color:"var(--color-text-secondary)"}}>
+                    {v2Summary.priority.exact} of {v2Summary.fetched} tickets match every filter; the rest are near-miss top-ups (checked against live Gorgias tags).
+                    {v2Summary.priority.topMisses.length>0&&(" Most often missed: "+v2Summary.priority.topMisses.slice(0,3).map(function(m){return m[0]+" ("+m[1]+")";}).join(", ")+".")}
+                  </p>
+                  <div style={{overflowX:"auto"}}>
+                    <table style={{width:"100%",borderCollapse:"collapse",fontSize:"12px"}}>
+                      <thead><tr style={{background:"var(--color-background-secondary)"}}>
+                        {["Agent","Picked","Exact match","1 filter off","2+ filters off","vs target"].map(function(h){return <th key={h} style={{padding:"6px 10px",textAlign:h==="Agent"?"left":"center",fontSize:"11px",fontWeight:600,color:"var(--color-text-secondary)",borderBottom:"0.5px solid var(--color-border-tertiary)",whiteSpace:"nowrap"}}>{h}</th>;})}
+                      </tr></thead>
+                      <tbody>{v2Summary.priority.agents.map(function(a){
+                        var short = v2Summary.priority.target - a.total;
+                        return <tr key={a.agent} style={{borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
+                          <td style={{padding:"5px 10px",whiteSpace:"nowrap"}}>{a.agent}</td>
+                          <td style={{padding:"5px 10px",textAlign:"center",fontWeight:600}}>{a.total}</td>
+                          <td style={{padding:"5px 10px",textAlign:"center",color:a.exact?"var(--color-text-success)":"var(--color-text-secondary)"}}>{a.exact}</td>
+                          <td style={{padding:"5px 10px",textAlign:"center",color:a.off1?"var(--color-text-warning)":"var(--color-text-secondary)"}}>{a.off1}</td>
+                          <td style={{padding:"5px 10px",textAlign:"center",color:a.off2?"var(--color-text-danger)":"var(--color-text-secondary)"}}>{a.off2}</td>
+                          <td style={{padding:"5px 10px",textAlign:"center",color:short>0?"var(--color-text-danger)":"var(--color-text-secondary)"}}>{short>0?(short+" short"):"met"}</td>
+                        </tr>;
+                      })}</tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
               {v2Summary.rateLimited&&(
                 <p style={{fontSize:"11px",color:"var(--color-text-warning)",margin:"10px 0 0"}}>
                   Gorgias rate-limited part of this run — it backed off and retried, but double-check the fetched count against what you pasted.
@@ -7352,66 +7623,60 @@ Rules:
       {view==="manual"&&isEditor&&(
         <div>
           <div style={{...card,marginBottom:"16px"}}>
-            <p style={{...sectionLabel,marginBottom:"14px"}}>Manual Audit</p>
-            <p style={{fontSize:"12px",color:"var(--color-text-secondary)",marginBottom:"16px"}}>Score a single ticket manually. Paste the transcript and fill in ticket details — AI will score it using the same rubric as batch QA.</p>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px",marginBottom:"12px"}}>
-              <div>
-                <label style={{...lbl,marginBottom:"4px"}}>Ticket ID *</label>
-                <input type="text" placeholder="e.g. 443167229" value={manualForm.ticketId}
-                  onChange={function(e){setManualForm(function(f){return Object.assign({},f,{ticketId:e.target.value});});}}
-                  style={{width:"100%",boxSizing:"border-box",fontSize:"12px",padding:"6px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/>
+            {/* v3.2.0: one input. Everything else is loaded from Gorgias so nothing can be mistyped. */}
+            <div style={{display:"flex",gap:"10px",alignItems:"flex-end",flexWrap:"wrap"}}>
+              <div style={{flex:"0 1 260px"}}>
+                <label style={lbl} htmlFor="manualTid">Gorgias ticket ID</label>
+                <input id="manualTid" type="text" inputMode="numeric" placeholder="e.g. 443167229" value={manualTicketId}
+                  onChange={function(e){ setManualTicketId(e.target.value.replace(/[^0-9]/g,"")); if(manualLoaded) { setManualLoaded(null); setManualResult(null); } }}
+                  onKeyDown={function(e){ if(e.key==="Enter"&&manualTicketId&&!manualLoading) loadManualFromGorgias(); }}
+                  style={{width:"100%",boxSizing:"border-box",fontSize:"14px",padding:"8px 10px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/>
               </div>
-              <div>
-                <label style={{...lbl,marginBottom:"4px"}}>Agent *</label>
-                <select value={manualForm.agentName}
-                  onChange={function(e){setManualForm(function(f){return Object.assign({},f,{agentName:e.target.value});});}}
-                  style={{width:"100%",boxSizing:"border-box",fontSize:"12px",padding:"6px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}>
-                  <option value="">Select agent...</option>
-                  {agentList().map(function(a){return <option key={a} value={a}>{a}</option>;})}
-                </select>
-              </div>
-              <div>
-                <label style={{...lbl,marginBottom:"4px"}}>Contact Reason</label>
-                <input type="text" placeholder="e.g. Cancel::Subscription (Aware)" value={manualForm.contactReason}
-                  onChange={function(e){setManualForm(function(f){return Object.assign({},f,{contactReason:e.target.value});});}}
-                  style={{width:"100%",boxSizing:"border-box",fontSize:"12px",padding:"6px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/>
-              </div>
-              <div>
-                <label style={{...lbl,marginBottom:"4px"}}>Ticket URL</label>
-                <input type="text" placeholder="https://freedomgrooming.gorgias.com/..." value={manualForm.ticketUrl}
-                  onChange={function(e){setManualForm(function(f){return Object.assign({},f,{ticketUrl:e.target.value});});}}
-                  style={{width:"100%",boxSizing:"border-box",fontSize:"12px",padding:"6px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/>
-              </div>
-              <div>
-                <label style={{...lbl,marginBottom:"4px"}}>Customer Email</label>
-                <input type="text" placeholder="customer@email.com" value={manualForm.customerEmail}
-                  onChange={function(e){setManualForm(function(f){return Object.assign({},f,{customerEmail:e.target.value});});}}
-                  style={{width:"100%",boxSizing:"border-box",fontSize:"12px",padding:"6px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/>
-              </div>
-              <div>
-                <label style={{...lbl,marginBottom:"4px"}}>Week</label>
-                <input type="text" placeholder="e.g. Apr 27 - May 3 2026" value={manualForm.week}
-                  onChange={function(e){setManualForm(function(f){return Object.assign({},f,{week:e.target.value});});}}
-                  style={{width:"100%",boxSizing:"border-box",fontSize:"12px",padding:"6px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/>
-              </div>
+              <button onClick={loadManualFromGorgias} disabled={!manualTicketId||manualLoading||manualRunning}
+                style={{...btnInfo,opacity:(!manualTicketId||manualLoading||manualRunning)?0.5:1}}>{manualLoading?"Loading…":"Load from Gorgias"}</button>
+              {(manualLoaded||manualResult)&&<button onClick={resetManualAudit} style={ghost}>Clear</button>}
+              {!(window.__ENV__&&window.__ENV__.GORGIAS_CONFIGURED)&&<span style={{fontSize:"12px",color:"var(--color-text-danger)"}}>Gorgias is not configured on the server.</span>}
             </div>
-            <div style={{marginBottom:"14px"}}>
-              <label style={{...lbl,marginBottom:"4px"}}>Transcript * — paste directly from Gorgias</label>
-              <textarea value={manualForm.transcript}
-                onChange={function(e){setManualForm(function(f){return Object.assign({},f,{transcript:e.target.value});});}}
-                placeholder="Paste the full ticket conversation here..."
-                style={{width:"100%",boxSizing:"border-box",height:"220px",resize:"vertical",fontFamily:"inherit",fontSize:"12px",lineHeight:"1.6",padding:"8px 10px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/>
-            </div>
-            {manualStatus&&<div style={{fontSize:"12px",color:"var(--color-text-info)",marginBottom:"10px"}}>{manualStatus}</div>}
-            <div style={{display:"flex",gap:"8px"}}>
-              <button onClick={runManualAudit} disabled={manualRunning}
-                style={{...btnSuccess,padding:"10px 24px",fontSize:"13px",opacity:manualRunning?0.6:1}}>
-                {manualRunning?"Scoring...":"Run AI Audit"}
-              </button>
-              <button onClick={function(){setManualForm({ticketId:"",agentName:"",contactReason:"",ticketUrl:"",customerEmail:"",week:"",transcript:""});setManualResult(null);}} style={ghost}>Clear</button>
-            </div>
+            {manualStatus&&<div style={{marginTop:"10px",fontSize:"12px",color:"var(--color-text-secondary)"}}>{manualStatus}</div>}
           </div>
-          {/* Result */}
+
+          {manualLoaded&&(function(){
+            var t = manualLoaded.ticket;
+            var pair = function(a,b){ return [a, b&&b!=="N/A"?b:""].filter(Boolean).join(" :: ")||"—"; };
+            var rowS = {display:"grid",gridTemplateColumns:"170px 1fr",gap:"10px",padding:"6px 0",borderBottom:"0.5px solid var(--color-border-tertiary)",fontSize:"13px"};
+            var keyS = {color:"var(--color-text-secondary)"};
+            return (
+              <div style={{...card,marginBottom:"16px"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",gap:"10px",flexWrap:"wrap",marginBottom:"10px"}}>
+                  <p style={{margin:0,fontSize:"15px",fontWeight:600}}>#{t.ticketId} — {t.subject}</p>
+                  <a href={t.ticketUrl} target="_blank" rel="noreferrer" style={{fontSize:"12px",color:"var(--color-text-info)"}}>Open in Gorgias</a>
+                </div>
+                {manualLoaded.warnings.map(function(w,i){ return <div key={i} style={{fontSize:"12px",padding:"7px 10px",marginBottom:"6px",borderRadius:"var(--border-radius-md)",background:"var(--color-background-warning)",color:"var(--color-text-warning)",border:"0.5px solid var(--color-border-warning)"}}>{w}</div>; })}
+                <div style={rowS}><span style={keyS}>Agent</span><span>{t.agentName ? t.agentName : (
+                  <select value={manualAgentOverride} onChange={function(e){setManualAgentOverride(e.target.value);}} style={{fontSize:"13px",padding:"4px 8px"}}>
+                    <option value="">Select agent…</option>
+                    {agentList().map(function(a){return <option key={a} value={a}>{a}</option>;})}
+                  </select>)}</span></div>
+                <div style={rowS}><span style={keyS}>Created</span><span>{t.createdDate||"—"}{t.createdDate?" · week "+(ticketWeekLabel(t.createdDate)||""):""}</span></div>
+                <div style={rowS}><span style={keyS}>Status / channel</span><span>{[t.status,t.initialChannel].filter(Boolean).join(" · ")||"—"}</span></div>
+                <div style={rowS}><span style={keyS}>Messages</span><span>{t.messageCount} total · {t.agentMessageCount==null?"—":t.agentMessageCount} from the agent</span></div>
+                <div style={rowS}><span style={keyS}>Contact Reason</span><span>{pair(t.contactReasonL1,t.contactReasonL2)}</span></div>
+                <div style={rowS}><span style={keyS}>Product</span><span>{pair(t.productL1,t.productL2)}</span></div>
+                <div style={rowS}><span style={keyS}>Ticket Resolution</span><span>{pair(t.resolutionL1,t.resolutionL2)}</span></div>
+                <div style={rowS}><span style={keyS}>Additional Resolution</span><span>{pair(t.addResolutionL1,t.addResolutionL2)}</span></div>
+                <p style={{fontSize:"11px",color:"var(--color-text-secondary)",margin:"8px 0 12px"}}>Tags are shown exactly as set in Gorgias — CTF Accuracy scores them as-is, so they can't be edited here.</p>
+                <details>
+                  <summary style={{cursor:"pointer",fontSize:"12px",color:"var(--color-text-info)"}}>Transcript ({(t.transcript||"").length.toLocaleString()} characters)</summary>
+                  <div style={{marginTop:"8px",maxHeight:"280px",overflowY:"auto",fontSize:"12px",lineHeight:"1.7",whiteSpace:"pre-wrap",background:"var(--color-background-secondary)",padding:"10px",borderRadius:"var(--border-radius-md)"}}>{t.transcript||"(empty)"}</div>
+                </details>
+                <div style={{display:"flex",gap:"8px",marginTop:"14px"}}>
+                  <button onClick={runManualAudit} disabled={manualRunning||manualLoaded.noTranscript||(!t.agentName&&!manualAgentOverride)}
+                    style={{...btnInfo,opacity:(manualRunning||manualLoaded.noTranscript||(!t.agentName&&!manualAgentOverride))?0.5:1}}>{manualRunning?"Scoring…":"Run AI audit"}</button>
+                </div>
+              </div>
+            );
+          })()}
+
           {manualResult&&(
             <div style={card}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"12px"}}>
@@ -8017,82 +8282,102 @@ Rules:
         </div>
       )}
       {/* ── MATRIX ── */}
-      {view==="matrix"&&(
+      {view==="matrix"&&isEditor&&(function(){
+        // v3.2.0: read-only by default; Full users get an Edit button per section.
+        var canEdit = isFullAccess;
+        var dirty = matrixSnapshot!==null && JSON.stringify({m:matrix,a:autofailList,c:scoringContext})!==matrixSnapshot;
+        var editBtn = function(id){ return canEdit ? <button onClick={function(){setEditingCat(editingCat===id?null:id);}} style={{...(editingCat===id?btnInfo:ghost),fontSize:"12px",padding:"5px 12px"}}>{editingCat===id?"Done":"Edit"}</button> : null; };
+        return (
         <div>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"14px",flexWrap:"wrap",gap:"8px"}}>
-            <p style={{margin:0,fontSize:"13px",color:"var(--color-text-secondary)"}}>Edit scoring categories and autofail conditions.</p>
-            <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
-              {matrixSaved&&<span style={{fontSize:"12px",color:"var(--color-text-success)"}}>Saved!</span>}
-              <button onClick={function(){if(window.confirm("Reset to defaults?")){setMatrix(getDefaultMatrix());setAutofailList(DEFAULT_AUTOFAILS);}}} style={ghost}>Reset</button>
-              <button onClick={saveMatrix} style={btnInfo}>Save matrix</button>
-            </div>
+          <style>{MATRIX_CSS}</style>
+          <div className="wm-mx-bar">
+            <span style={{fontSize:"12px",color:"var(--color-text-secondary)"}}>
+              {matrixVersion?("Version "+matrixVersion):"Default matrix (not saved yet)"}{!canEdit?" · Read-only — only Full users can edit":""}
+            </span>
+            {canEdit&&(
+              <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
+                {dirty&&<span className="wm-mx-dirty">Unsaved changes</span>}
+                {matrixSaved&&<span style={{fontSize:"12px",color:"var(--color-text-success)",fontWeight:600}}>Saved</span>}
+                <button onClick={function(){if(window.confirm("Reset the matrix and autofails to the built-in defaults? This only changes your screen until you save.")){setMatrix(getDefaultMatrix());setAutofailList(DEFAULT_AUTOFAILS);}}} style={ghost}>Reset to defaults</button>
+                <button onClick={function(){setEditingCat(null);saveMatrix();}} style={btnInfo}>Save matrix</button>
+              </div>
+            )}
           </div>
 
-          {/* Scoring Context — global notes injected into every AI scoring prompt */}
-          <div style={{...card,marginBottom:"16px"}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"8px"}}>
-              <div>
-                <p style={{margin:"0 0 2px",fontSize:"13px",fontWeight:600}}>Scoring Context</p>
-                <p style={{margin:0,fontSize:"12px",color:"var(--color-text-secondary)"}}>Global notes injected into every AI scoring prompt. Use this for workflow rules, SOP context, or anything the AI should know when evaluating all tickets.</p>
-              </div>
-            </div>
-            <textarea
-              value={scoringContext}
-              onChange={function(e){setScoringContext(e.target.value);}}
-              placeholder="e.g. Tickets are closed after every agent reply as standard operating procedure..."
-              style={{width:"100%",boxSizing:"border-box",fontSize:"12px",padding:"8px 10px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",minHeight:"80px",resize:"vertical",fontFamily:"inherit",lineHeight:"1.5"}}
-            />
-            <div style={{display:"flex",justifyContent:"flex-end",marginTop:"6px"}}>
-              <button onClick={saveMatrix} style={{...btnInfo,fontSize:"12px"}}>Save</button>
-            </div>
-          </div>
+          {/* Scoring context — injected into every AI scoring prompt */}
+          <section className="wm-mx">
+            <div className="wm-mx-head"><h3>Scoring context</h3><div className="wm-mx-actions">{editBtn("__context")}</div></div>
+            <p className="wm-mx-sub">Applies to every ticket</p>
+            {editingCat==="__context"
+              ? <AutoTextarea value={scoringContext} onChange={function(e){setScoringContext(e.target.value);}} placeholder="e.g. Tickets are closed after every agent reply as standard operating procedure..."/>
+              : <p className="wm-mx-text" style={{margin:0,color:scoringContext?undefined:"var(--color-text-secondary)"}}>{scoringContext||"No scoring context set."}</p>}
+          </section>
+
           {matrix.map(function(cat){
-            return <div key={cat.id} style={card}>
-              <div onClick={function(){setEditingCat(editingCat===cat.id?null:cat.id);}} style={{display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer",userSelect:"none"}}>
-                <div style={{display:"flex",gap:"10px",alignItems:"center"}}>
-                  <span style={{fontSize:"14px",fontWeight:500}}>{cat.label}</span>
-                  <span style={{fontSize:"11px",padding:"2px 8px",borderRadius:"var(--border-radius-md)",background:"var(--color-background-secondary)",color:"var(--color-text-secondary)"}}>max {cat.max}pt</span>
-                </div>
-                <span style={{fontSize:"14px",color:"var(--color-text-secondary)"}}>{editingCat===cat.id?"↑":"↓"}</span>
-              </div>
-              {editingCat===cat.id&&(
-                <div style={{marginTop:"16px",borderTop:"0.5px solid var(--color-border-tertiary)",paddingTop:"16px"}}>
-                  <div style={{display:"grid",gridTemplateColumns:"2fr 1fr",gap:"10px",marginBottom:"12px"}}>
-                    <div><label style={lbl}>Category name</label><input style={inp} value={cat.label} onChange={function(e){updateCatField(cat.id,"label",e.target.value);}}/></div>
-                    <div><label style={lbl}>Max points</label><input style={{width:"80px"}} type="number" step="0.5" min="0" value={cat.max} onChange={function(e){updateCatField(cat.id,"max",parseFloat(e.target.value)||0);}}/></div>
+            var editing = editingCat===cat.id;
+            return (
+              <section className="wm-mx" key={cat.id}>
+                <div className="wm-mx-head">
+                  {editing
+                    ? <input value={cat.label} onChange={function(e){updateCatField(cat.id,"label",e.target.value);}} aria-label="Category name" style={{flex:1,fontSize:"17px",fontWeight:600,padding:"5px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/>
+                    : <h3>{cat.label}</h3>}
+                  <div className="wm-mx-actions">
+                    {editing
+                      ? <label style={{fontSize:"12px",color:"var(--color-text-secondary)",display:"flex",alignItems:"center",gap:"6px"}}>Max
+                          <input type="number" step="0.5" min="0" value={cat.max} onChange={function(e){updateCatField(cat.id,"max",parseFloat(e.target.value)||0);}} style={{width:"64px",fontSize:"13px",padding:"4px 6px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/> pts</label>
+                      : <span className="wm-mx-max">MAX {cat.max} PT{cat.max===1?"":"S"}</span>}
+                    {editBtn(cat.id)}
                   </div>
-                  <div style={{marginBottom:"14px"}}><label style={lbl}>What it measures</label><textarea style={ta("56px")} value={cat.whatItMeasures} onChange={function(e){updateCatField(cat.id,"whatItMeasures",e.target.value);}}/></div>
-                  <p style={sectionLabel}>Score levels</p>
-                  {cat.levels.map(function(lvl,lvlIdx){
-                    return <div key={lvlIdx} style={{border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-md)",marginBottom:"6px",padding:"10px 12px"}}>
-                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginBottom:"8px"}}>
-                        <div><label style={lbl}>Level</label><input value={lvl.level} onChange={function(e){updateLevelField(cat.id,lvlIdx,"level",e.target.value);}} style={{width:"100%",boxSizing:"border-box"}}/></div>
-                        <div><label style={lbl}>Points</label><input type="number" step="0.5" value={lvl.points!=null?lvl.points:""} onChange={function(e){updateLevelField(cat.id,lvlIdx,"points",e.target.value===""?null:parseFloat(e.target.value));}} style={{width:"100px"}}/></div>
-                      </div>
-                      <label style={lbl}>Definition</label>
-                      <textarea style={ta("48px")} value={lvl.definition} onChange={function(e){updateLevelField(cat.id,lvlIdx,"definition",e.target.value);}}/>
-                    </div>;
-                  })}
                 </div>
-              )}
-            </div>;
+                <p className="wm-mx-sub">What it measures</p>
+                {editing
+                  ? <div style={{marginBottom:"14px"}}><AutoTextarea value={cat.whatItMeasures||""} onChange={function(e){updateCatField(cat.id,"whatItMeasures",e.target.value);}}/></div>
+                  : <p className="wm-mx-text">{cat.whatItMeasures}</p>}
+                <div style={{overflowX:"auto"}}>
+                  <table className={"wm-mx-table"+(editing?" editing":"")}>
+                    <thead><tr><th style={{width:"92px",textAlign:"center"}}>Level</th><th className="pts" style={{width:editing?"74px":"52px",textAlign:"center"}}>Pts</th><th>Definition</th></tr></thead>
+                    <tbody>{cat.levels.map(function(lvl,li){
+                      var col = matrixLevelColor(lvl.level);
+                      return <tr key={li}>
+                        <td className="lvl" style={{background:col}}>{editing ? <input value={lvl.level} aria-label="Level" onChange={function(e){updateLevelField(cat.id,li,"level",e.target.value);}}/> : lvl.level}</td>
+                        <td className="pts" style={{background:col}}>{editing ? <input type="number" step="0.5" aria-label="Points" placeholder="—" value={lvl.points!=null?lvl.points:""} onChange={function(e){updateLevelField(cat.id,li,"points",e.target.value===""?null:parseFloat(e.target.value));}}/> : (lvl.points!=null?lvl.points:"—")}</td>
+                        <td className="def">{editing ? <AutoTextarea value={lvl.definition||""} onChange={function(e){updateLevelField(cat.id,li,"definition",e.target.value);}}/> : lvl.definition}</td>
+                      </tr>;
+                    })}</tbody>
+                  </table>
+                </div>
+              </section>
+            );
           })}
-          <div style={card}>
-            <p style={{margin:"0 0 12px",fontWeight:500,fontSize:"14px"}}>Autofail conditions</p>
-            {autofailList.map(function(af,i){
-              return <div key={i} style={{display:"flex",gap:"8px",alignItems:"flex-start",marginBottom:"8px"}}>
-                <textarea style={{...ta("44px"),flex:1}} value={af} onChange={function(e){var u=autofailList.slice();u[i]=e.target.value;setAutofailList(u);}}/>
-                <button onClick={function(){setAutofailList(autofailList.filter(function(_,j){return j!==i;}));}} style={{background:"none",border:"none",cursor:"pointer",fontSize:"12px",color:"var(--color-text-danger)",padding:"6px 4px"}}>Remove</button>
-              </div>;
-            })}
-            <div style={{display:"flex",gap:"8px",marginTop:"8px"}}>
-              <input style={{flex:1}} placeholder="Add new autofail..." value={newAutofail} onChange={function(e){setNewAutofail(e.target.value);}} onKeyDown={function(e){if(e.key==="Enter"&&newAutofail.trim()){setAutofailList(autofailList.concat([newAutofail.trim()]));setNewAutofail("");}}}/>
-              <button onClick={function(){if(newAutofail.trim()){setAutofailList(autofailList.concat([newAutofail.trim()]));setNewAutofail("");}}} style={btnInfo}>Add</button>
-            </div>
-          </div>
-          <div style={{display:"flex",justifyContent:"flex-end",marginTop:"4px"}}><button onClick={saveMatrix} style={btnInfo}>Save matrix</button></div>
-        </div>
-      )}
+
+          {/* Autofail conditions */}
+          <section className="wm-mx">
+            <div className="wm-mx-head"><h3>Autofail conditions</h3><div className="wm-mx-actions"><span className="wm-mx-max" style={{background:"#c53030"}}>SCORE → 0</span>{editBtn("__autofails")}</div></div>
+            {editingCat==="__autofails" ? (
+              <div>
+                {autofailList.map(function(af,i){
+                  return <div key={i} style={{display:"flex",gap:"8px",alignItems:"flex-start",marginBottom:"8px"}}>
+                    <AutoTextarea value={af} onChange={function(e){var u=autofailList.slice();u[i]=e.target.value;setAutofailList(u);}}/>
+                    <button onClick={function(){setAutofailList(autofailList.filter(function(_,j){return j!==i;}));}} style={{...ghost,fontSize:"12px",color:"var(--color-text-danger)",flex:"none"}}>Remove</button>
+                  </div>;
+                })}
+                <div style={{display:"flex",gap:"8px",marginTop:"4px"}}>
+                  <input placeholder="Add an autofail condition…" value={newAutofail} onChange={function(e){setNewAutofail(e.target.value);}}
+                    onKeyDown={function(e){if(e.key==="Enter"&&newAutofail.trim()){setAutofailList(autofailList.concat([newAutofail.trim()]));setNewAutofail("");}}}
+                    style={{flex:1,fontSize:"13px",padding:"7px 10px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}/>
+                  <button onClick={function(){if(newAutofail.trim()){setAutofailList(autofailList.concat([newAutofail.trim()]));setNewAutofail("");}}} style={btnInfo}>Add</button>
+                </div>
+              </div>
+            ) : (
+              autofailList.length
+                ? <ol style={{margin:0,paddingLeft:"20px",fontSize:"13.5px",lineHeight:"1.65"}}>{autofailList.map(function(af,i){return <li key={i} style={{marginBottom:"4px",whiteSpace:"pre-wrap"}}>{af}</li>;})}</ol>
+                : <p className="wm-mx-text" style={{margin:0,color:"var(--color-text-secondary)"}}>No autofail conditions.</p>
+            )}
+          </section>
+
+          {canEdit&&dirty&&<div style={{display:"flex",justifyContent:"flex-end"}}><button onClick={function(){setEditingCat(null);saveMatrix();}} style={btnInfo}>Save matrix</button></div>}
+        </div>);
+      })()}
 
       {/* ── CTF ── */}
       {view==="ctf"&&(
@@ -8595,7 +8880,7 @@ Rules:
             <div style={{borderBottom:"0.5px solid var(--color-border-tertiary)",marginBottom:"0",flexShrink:0}}>
               {/* Tabs */}
               <div style={{display:"flex",gap:"0",borderBottom:"none"}}>
-                {[["access","Access Control"]].map(function(tab){
+                {[["access","User Management"]].concat(isFullAccess?[["admin","Admin Tools"]]:[]).map(function(tab){ /* tab ids "access"/"admin" are internal; labels are UI-only */
                   return <button key={tab[0]} onClick={function(){setSettingsTab(tab[0]);}} style={{padding:"8px 16px",border:"none",borderBottom:settingsTab===tab[0]?"2px solid #2563eb":"2px solid transparent",background:"none",cursor:"pointer",fontSize:"13px",fontWeight:settingsTab===tab[0]?600:400,color:settingsTab===tab[0]?"var(--color-text-info)":"var(--color-text-secondary)"}}>
                     {tab[1]}
                   </button>;
@@ -8609,6 +8894,7 @@ Rules:
               {/* ── ACCESS CONTROL TAB ── */}
               {settingsTab==="access"&&(
                 <div>
+                  {/* ── USER MANAGEMENT TAB (internal tab id "access" unchanged) ── */}
                   {/* Read-only notice for Edit users */}
                   {!isFullAccess&&(
                     <div style={{padding:"10px 14px",background:"var(--color-background-info)",border:"0.5px solid var(--color-border-info)",borderRadius:"var(--border-radius-md)",fontSize:"12px",color:"var(--color-text-info)",marginBottom:"16px"}}>
@@ -8732,93 +9018,19 @@ Rules:
                     </div>
                   </div>
 
-                  {/* Database (Postgres) — import / verify / cutover. Full access only */}
+                  {/* Save button — Full only */}
                   {isFullAccess&&(
-                    <div style={{border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
-                      <p style={{margin:"0 0 4px",fontSize:"13px",fontWeight:600}}>Database</p>
-                      <p style={{margin:"0 0 12px",fontSize:"12px",color:"var(--color-text-secondary)"}}>One-time move from Notion: import, verify that 100% of Notion data is in Postgres, then mark cutover complete. Wingman stays read-only until cutover.</p>
-                      <DatabaseAdminPanel addToast={addToast} onStateChange={function(d){ setMigrationMode(!(d&&d.cutover&&d.cutover.done)); }}/>
+                    <div style={{display:"flex",justifyContent:"flex-end",gap:"10px",alignItems:"center"}}>
+                      {userListDirty&&<span style={{fontSize:"12px",color:"var(--color-text-secondary)"}}>You have unsaved changes</span>}
+                      <button
+                        onClick={saveUsersToDb}
+                        disabled={savingUsers||!userListDirty}
+                        style={{...btnInfo,opacity:savingUsers||!userListDirty?0.5:1,padding:"8px 20px",fontSize:"13px",fontWeight:600}}
+                      >
+                        {savingUsers?"Saving...":"Save changes"}
+                      </button>
                     </div>
                   )}
-
-                  {/* Data integrity — Full access only */}
-                  {isFullAccess&&(
-                    <div style={{border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
-                      <p style={{margin:"0 0 4px",fontSize:"13px",fontWeight:600}}>Data Integrity</p>
-                      <p style={{margin:"0 0 12px",fontSize:"12px",color:"var(--color-text-secondary)"}}>Recalculate Final Passed for all tickets based on current Final Score. Fixes pass/fail flags that are out of sync after disputes.</p>
-                      <button onClick={recalcFinalPassed} style={{...btnInfo,fontSize:"12px"}}>Recalculate Final Passed</button>
-
-                      <div style={{marginTop:"20px",paddingTop:"16px",borderTop:"0.5px solid var(--color-border-tertiary)"}}>
-                        <p style={{margin:"0 0 4px",fontSize:"13px",fontWeight:600}}>One-time CTF correction</p>
-                        <p style={{margin:"0 0 10px",fontSize:"12px",color:"var(--color-text-secondary)"}}>
-                          Re-scores <strong>CTF Accuracy only</strong> for a week affected by the tag-visibility bug (fixed in v2.0.93). Other categories are untouched.
-                          Only ever <strong>raises</strong> a score — anything scoring lower is listed, not applied. Tickets whose CTF dispute a human already approved or rejected are skipped entirely.
-                          A pending CTF dispute the re-run supports is auto-approved; one it doesn't is left pending for you. Bypasses the Wednesday lock and logs every change to Reaudit History.
-                        </p>
-                        <div style={{display:"flex",gap:"8px",alignItems:"flex-end",flexWrap:"wrap",marginBottom:"10px"}}>
-                          <div>
-                            <label style={{...lbl,marginBottom:"4px"}}>Week</label>
-                            <select value={ctfFixWeek} onChange={function(e){setCtfFixWeek(e.target.value);setCtfFixPreview(null);}}
-                              style={{fontSize:"12px",padding:"6px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}>
-                              <option value="">Select week...</option>
-                              {[...new Set(tickets.map(function(t){return t.week;}).filter(Boolean))].sort().reverse().map(function(w){
-                                return <option key={w} value={w}>{w}</option>;
-                              })}
-                            </select>
-                          </div>
-                          <button onClick={runCtfFixPreview} disabled={ctfFixRunning||ctfFixApplying||!ctfFixWeek}
-                            style={{...btnInfo,fontSize:"12px",opacity:(ctfFixRunning||ctfFixApplying||!ctfFixWeek)?0.5:1}}>
-                            {ctfFixRunning?"Scanning...":"Preview changes"}
-                          </button>
-                          {(ctfFixRunning||ctfFixApplying)&&(
-                            <button onClick={function(){ctfFixStopRef.current=true;}} style={{...ghost,fontSize:"12px"}}>Stop</button>
-                          )}
-                        </div>
-                        {ctfFixStatus&&<p style={{margin:"0 0 10px",fontSize:"11px",color:"var(--color-text-info)"}}>{ctfFixStatus}</p>}
-
-                        {ctfFixPreview&&(
-                          <div style={{border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-md)",padding:"12px",background:"var(--color-background-secondary)"}}>
-                            <p style={{margin:"0 0 8px",fontSize:"12px",fontWeight:600}}>Preview — nothing written yet</p>
-                            <div style={{display:"flex",gap:"14px",flexWrap:"wrap",fontSize:"11px",marginBottom:"10px"}}>
-                              <span style={{color:"var(--color-text-success)"}}><strong>{ctfFixPreview.raise.length}</strong> will be raised</span>
-                              <span style={{color:"var(--color-text-warning)"}}><strong>{ctfFixPreview.lower.length}</strong> scored lower (skipped)</span>
-                              <span style={{color:"var(--color-text-secondary)"}}><strong>{ctfFixPreview.same.length}</strong> unchanged</span>
-                              <span style={{color:"var(--color-text-secondary)"}}><strong>{ctfFixPreview.skipped.length}</strong> skipped</span>
-                              {ctfFixPreview.errors.length>0&&<span style={{color:"var(--color-text-danger)"}}><strong>{ctfFixPreview.errors.length}</strong> errors</span>}
-                            </div>
-                            {ctfFixPreview.raise.length>0&&(
-                              <div style={{maxHeight:"180px",overflowY:"auto",marginBottom:"10px"}}>
-                                {ctfFixPreview.raise.map(function(r){
-                                  return <div key={r.t.ticketId} style={{fontSize:"11px",padding:"4px 0",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
-                                    <strong>#{r.t.ticketId}</strong> {r.t.agentName} — CTF <span style={{color:"var(--color-text-danger)"}}>{r.oldLevel||"(none)"}</span> → <span style={{color:"var(--color-text-success)"}}>{r.newLevel}</span>
-                                    {r.dispute&&r.dispute.status==="pending"&&<span style={{color:"var(--color-text-info)"}}> · pending dispute</span>}
-                                  </div>;
-                                })}
-                              </div>
-                            )}
-                            {ctfFixPreview.lower.length>0&&(
-                              <div style={{marginBottom:"10px"}}>
-                                <p style={{margin:"0 0 4px",fontSize:"11px",fontWeight:600,color:"var(--color-text-warning)"}}>Scored lower — NOT applied, review manually:</p>
-                                {ctfFixPreview.lower.map(function(r){
-                                  return <div key={r.t.ticketId} style={{fontSize:"11px",color:"var(--color-text-secondary)"}}>#{r.t.ticketId} — {r.oldLevel} → {r.newLevel}</div>;
-                                })}
-                              </div>
-                            )}
-                            <button onClick={applyCtfFix} disabled={ctfFixApplying||ctfFixPreview.raise.length===0}
-                              style={{...btnSuccess,fontSize:"12px",opacity:(ctfFixApplying||ctfFixPreview.raise.length===0)?0.5:1}}>
-                              {ctfFixApplying?"Applying...":"Apply "+ctfFixPreview.raise.length+" correction"+(ctfFixPreview.raise.length!==1?"s":"")}
-                            </button>
-                            <button onClick={function(){setCtfFixPreview(null);}} style={{...ghost,fontSize:"12px",marginLeft:"6px"}}>Discard</button>
-                          </div>
-                        )}
-                      </div>
-                      <div style={{marginTop:"20px",paddingTop:"16px",borderTop:"0.5px solid var(--color-border-tertiary)"}}>
-                        <p style={{margin:"0 0 12px",fontSize:"12px",color:"var(--color-text-secondary)"}}>Export a debug log of recent activity and errors. Attach this when reporting an issue so it can be traced.</p>
-                        <button onClick={function(){window.exportWingmanLog();addToast("Debug log exported");}} style={{...ghost,fontSize:"12px"}}>Export debug log</button>
-                      </div>
-                    </div>
-                  )}
-
                   {/* Add user form — Full access only */}
                   {isFullAccess&&(
                     <div style={{border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
@@ -8882,18 +9094,100 @@ Rules:
                     })}
                   </div>
 
-                  {/* Save button — Full only */}
+                </div>
+              )}
+
+              {/* ── ADMIN TOOLS TAB (Full access only) ── */}
+              {settingsTab==="admin"&&isFullAccess&&(
+                <div>
+                  {/* Database (Postgres) — import / verify / cutover. Full access only */}
                   {isFullAccess&&(
-                    <div style={{display:"flex",justifyContent:"flex-end",gap:"10px",alignItems:"center"}}>
-                      {userListDirty&&<span style={{fontSize:"12px",color:"var(--color-text-secondary)"}}>You have unsaved changes</span>}
-                      <button
-                        onClick={saveUsersToDb}
-                        disabled={savingUsers||!userListDirty}
-                        style={{...btnInfo,opacity:savingUsers||!userListDirty?0.5:1,padding:"8px 20px",fontSize:"13px",fontWeight:600}}
-                      >
-                        {savingUsers?"Saving...":"Save changes"}
-                      </button>
+                    <div style={{border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
+                      <p style={{margin:"0 0 4px",fontSize:"13px",fontWeight:600}}>Database</p>
+                      <p style={{margin:"0 0 12px",fontSize:"12px",color:"var(--color-text-secondary)"}}>One-time move from Notion: import, verify that 100% of Notion data is in Postgres, then mark cutover complete. Wingman stays read-only until cutover.</p>
+                      <DatabaseAdminPanel addToast={addToast} onStateChange={function(d){ setMigrationMode(!(d&&d.cutover&&d.cutover.done)); }}/>
                     </div>
+                  )}
+
+                  {/* Data integrity — Full access only */}
+                  {isFullAccess&&(
+                    <div style={{border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
+                      <p style={{margin:"0 0 4px",fontSize:"13px",fontWeight:600}}>Data Integrity</p>
+                      <p style={{margin:"0 0 12px",fontSize:"12px",color:"var(--color-text-secondary)"}}>Recalculate Final Passed for all tickets based on current Final Score. Fixes pass/fail flags that are out of sync after disputes.</p>
+                      <button onClick={recalcFinalPassed} style={{...btnInfo,fontSize:"12px"}}>Recalculate Final Passed</button>
+
+                      <div style={{marginTop:"20px",paddingTop:"16px",borderTop:"0.5px solid var(--color-border-tertiary)"}}>
+                        <p style={{margin:"0 0 12px",fontSize:"12px",color:"var(--color-text-secondary)"}}>Export a debug log of recent activity and errors. Attach this when reporting an issue so it can be traced.</p>
+                        <button onClick={function(){window.exportWingmanLog();addToast("Debug log exported");}} style={{...ghost,fontSize:"12px"}}>Export debug log</button>
+                      </div>
+                    </div>
+                  )}
+                  {/* One-time CTF correction — Full access only (own card since v3.2.0) */}
+                  {isFullAccess&&(
+                      <div style={{border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
+                        <p style={{margin:"0 0 4px",fontSize:"13px",fontWeight:600}}>One-time CTF correction</p>
+                        <p style={{margin:"0 0 10px",fontSize:"12px",color:"var(--color-text-secondary)"}}>
+                          Re-scores <strong>CTF Accuracy only</strong> for a week affected by the tag-visibility bug (fixed in v2.0.93). Other categories are untouched.
+                          Only ever <strong>raises</strong> a score — anything scoring lower is listed, not applied. Tickets whose CTF dispute a human already approved or rejected are skipped entirely.
+                          A pending CTF dispute the re-run supports is auto-approved; one it doesn't is left pending for you. Bypasses the Wednesday lock and logs every change to Reaudit History.
+                        </p>
+                        <div style={{display:"flex",gap:"8px",alignItems:"flex-end",flexWrap:"wrap",marginBottom:"10px"}}>
+                          <div>
+                            <label style={{...lbl,marginBottom:"4px"}}>Week</label>
+                            <select value={ctfFixWeek} onChange={function(e){setCtfFixWeek(e.target.value);setCtfFixPreview(null);}}
+                              style={{fontSize:"12px",padding:"6px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"}}>
+                              <option value="">Select week...</option>
+                              {[...new Set(tickets.map(function(t){return t.week;}).filter(Boolean))].sort().reverse().map(function(w){
+                                return <option key={w} value={w}>{w}</option>;
+                              })}
+                            </select>
+                          </div>
+                          <button onClick={runCtfFixPreview} disabled={ctfFixRunning||ctfFixApplying||!ctfFixWeek}
+                            style={{...btnInfo,fontSize:"12px",opacity:(ctfFixRunning||ctfFixApplying||!ctfFixWeek)?0.5:1}}>
+                            {ctfFixRunning?"Scanning...":"Preview changes"}
+                          </button>
+                          {(ctfFixRunning||ctfFixApplying)&&(
+                            <button onClick={function(){ctfFixStopRef.current=true;}} style={{...ghost,fontSize:"12px"}}>Stop</button>
+                          )}
+                        </div>
+                        {ctfFixStatus&&<p style={{margin:"0 0 10px",fontSize:"11px",color:"var(--color-text-info)"}}>{ctfFixStatus}</p>}
+
+                        {ctfFixPreview&&(
+                          <div style={{border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-md)",padding:"12px",background:"var(--color-background-secondary)"}}>
+                            <p style={{margin:"0 0 8px",fontSize:"12px",fontWeight:600}}>Preview — nothing written yet</p>
+                            <div style={{display:"flex",gap:"14px",flexWrap:"wrap",fontSize:"11px",marginBottom:"10px"}}>
+                              <span style={{color:"var(--color-text-success)"}}><strong>{ctfFixPreview.raise.length}</strong> will be raised</span>
+                              <span style={{color:"var(--color-text-warning)"}}><strong>{ctfFixPreview.lower.length}</strong> scored lower (skipped)</span>
+                              <span style={{color:"var(--color-text-secondary)"}}><strong>{ctfFixPreview.same.length}</strong> unchanged</span>
+                              <span style={{color:"var(--color-text-secondary)"}}><strong>{ctfFixPreview.skipped.length}</strong> skipped</span>
+                              {ctfFixPreview.errors.length>0&&<span style={{color:"var(--color-text-danger)"}}><strong>{ctfFixPreview.errors.length}</strong> errors</span>}
+                            </div>
+                            {ctfFixPreview.raise.length>0&&(
+                              <div style={{maxHeight:"180px",overflowY:"auto",marginBottom:"10px"}}>
+                                {ctfFixPreview.raise.map(function(r){
+                                  return <div key={r.t.ticketId} style={{fontSize:"11px",padding:"4px 0",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
+                                    <strong>#{r.t.ticketId}</strong> {r.t.agentName} — CTF <span style={{color:"var(--color-text-danger)"}}>{r.oldLevel||"(none)"}</span> → <span style={{color:"var(--color-text-success)"}}>{r.newLevel}</span>
+                                    {r.dispute&&r.dispute.status==="pending"&&<span style={{color:"var(--color-text-info)"}}> · pending dispute</span>}
+                                  </div>;
+                                })}
+                              </div>
+                            )}
+                            {ctfFixPreview.lower.length>0&&(
+                              <div style={{marginBottom:"10px"}}>
+                                <p style={{margin:"0 0 4px",fontSize:"11px",fontWeight:600,color:"var(--color-text-warning)"}}>Scored lower — NOT applied, review manually:</p>
+                                {ctfFixPreview.lower.map(function(r){
+                                  return <div key={r.t.ticketId} style={{fontSize:"11px",color:"var(--color-text-secondary)"}}>#{r.t.ticketId} — {r.oldLevel} → {r.newLevel}</div>;
+                                })}
+                              </div>
+                            )}
+                            <button onClick={applyCtfFix} disabled={ctfFixApplying||ctfFixPreview.raise.length===0}
+                              style={{...btnSuccess,fontSize:"12px",opacity:(ctfFixApplying||ctfFixPreview.raise.length===0)?0.5:1}}>
+                              {ctfFixApplying?"Applying...":"Apply "+ctfFixPreview.raise.length+" correction"+(ctfFixPreview.raise.length!==1?"s":"")}
+                            </button>
+                            <button onClick={function(){setCtfFixPreview(null);}} style={{...ghost,fontSize:"12px",marginLeft:"6px"}}>Discard</button>
+                          </div>
+                        )}
+                      </div>
                   )}
                 </div>
               )}

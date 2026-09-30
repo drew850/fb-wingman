@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS ticket_snapshots (
   cf_product                TEXT,             -- 5807
   cf_ticket_resolution      TEXT,             -- 11375
   cf_additional_resolution  TEXT,             -- 11421
-  cf_7630                   TEXT,             -- 7630 (not read by the scorer today)
+  cf_7630                   TEXT,             -- 7630 "AI Intent" (not read by the scorer)
   created_datetime          TIMESTAMPTZ,
   opened_datetime           TIMESTAMPTZ,
   closed_datetime           TIMESTAMPTZ,
