@@ -1,4 +1,4 @@
-# Wingman server — v3.0.0
+# Wingman server — v3.1.0
 # Storage: Postgres (DATABASE_URL). Notion is used ONLY by the one-time import + verify
 # jobs under /api/admin/*, server-side, and is never proxied for the browser.
 import os, json, re, urllib.request, urllib.error, secrets, hashlib, time, threading, queue, base64, traceback, uuid
@@ -16,7 +16,7 @@ except Exception as _imp_err:  # server still boots and reports the problem on /
     psycopg = None
     _PSYCOPG_IMPORT_ERROR = str(_imp_err)
 
-SERVER_VERSION      = "3.0.0"
+SERVER_VERSION      = "3.1.0"
 HTML_FILE           = "Wingman.html"
 PORT                = int(os.environ.get("PORT", 3747))
 DIR                 = os.path.dirname(os.path.abspath(__file__))
@@ -403,14 +403,17 @@ def google_get_userinfo(access_token):
     resp = urllib.request.urlopen(req, timeout=10)
     return json.loads(resp.read())
 
-def create_session(email, name, via="google"):
+def create_session(email, name, via="google", picture=""):
     token = secrets.token_urlsafe(32)
+    # Google profile photo URL (v3.1.0). Only https URLs are kept; emergency logins have none.
+    pic = picture if isinstance(picture, str) and picture.startswith("https://") else ""
     with SESSIONS_LOCK:
         SESSIONS[token] = {
-            "email": email.lower().strip(),
-            "name":  name,
-            "via":   via,
-            "exp":   time.time() + SESSION_TTL
+            "email":   email.lower().strip(),
+            "name":    name,
+            "via":     via,
+            "picture": pic,
+            "exp":     time.time() + SESSION_TTL
         }
         # Clean expired sessions opportunistically
         expired = [k for k, v in SESSIONS.items() if v["exp"] < time.time()]
@@ -1868,6 +1871,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(403, "not a Wingman user")
             if user.get("active") is False:
                 raise ApiError(403, "account inactive")
+            user = dict(user, picture=sess.get("picture", ""))   # avatar for /api/me (never stored in the DB)
             for (m, rx, fn, min_rank, is_write) in ROUTES:
                 if m != method: continue
                 mt = re.fullmatch(rx, path)
@@ -1963,7 +1967,7 @@ class Handler(BaseHTTPRequestHandler):
                 name     = userinfo.get("name", email.split("@")[0])
                 if not email:
                     raise Exception("No email returned")
-                session_token = create_session(email, name, via="google")
+                session_token = create_session(email, name, via="google", picture=userinfo.get("picture", ""))
                 self._redirect(f"{BASE_URL}/?session={session_token}")
             except Exception as e:
                 print(f"[SSO] Auth error: {e}")
