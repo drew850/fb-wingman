@@ -2,10 +2,13 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.3.0
+  Version:  3.3.1
   Date:     2026-10-01
 
   Changelog:
+  v3.3.1 (2026-10-01) -- Matrix is viewable by every role (View/Agent included), read-only for everyone except Full.
+    Only Full users see Edit / Save / Reset; config writes stay Full-only on the server.
+
   v3.3.0 (2026-10-01) -- ADMIN TOOL: RE-SCORE WITH CURRENT MATRIX
     - Settings > Admin Tools > "Re-score with current matrix" (Full only). Re-runs the FULL AI audit (same prompt as
       AI Audit) on saved audits with the matrix saved in the database. For audits scored while v2 fell back to the
@@ -914,7 +917,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.3.0";
+const APP_VERSION = "v3.3.1";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -1916,7 +1919,7 @@ const NAV_MENU = [
   {group:"Analytics", items:[
     {view:"reports",   icon:"genreports",  min:"edit"},
     {view:"myreports", icon:"viewreports", min:"view"}]},
-  {view:"matrix", icon:"matrix", min:"edit"},   // v3.2.0: Edit users can read the matrix; only Full can edit
+  {view:"matrix", icon:"matrix", min:"view"},   // v3.3.1: everyone can read the matrix; only Full can edit
   {group:"Calibration", items:[
     {view:"calibration", icon:"aical",   min:"full"},
     {view:"teamcal",     icon:"teamcal", min:"edit"}]}
@@ -8471,7 +8474,7 @@ Rules:
         </div>
       )}
       {/* ── MATRIX ── */}
-      {view==="matrix"&&isEditor&&(function(){
+      {view==="matrix"&&(function(){ /* v3.3.1: visible to all roles, read-only unless Full */
         // v3.2.0: read-only by default; Full users get an Edit button per section.
         var canEdit = isFullAccess;
         var dirty = matrixSnapshot!==null && JSON.stringify({m:matrix,a:autofailList,c:scoringContext})!==matrixSnapshot;
