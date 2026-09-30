@@ -2,10 +2,25 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.2.0
+  Version:  3.3.0
   Date:     2026-10-01
 
   Changelog:
+  v3.3.0 (2026-10-01) -- ADMIN TOOL: RE-SCORE WITH CURRENT MATRIX
+    - Settings > Admin Tools > "Re-score with current matrix" (Full only). Re-runs the FULL AI audit (same prompt as
+      AI Audit) on saved audits with the matrix saved in the database. For audits scored while v2 fell back to the
+      built-in matrix. Scope: scored between two dates (defaults to this week, Manila time) or a ticket week;
+      "Skip audits already scored with vN" on by default.
+    - Two passes: Preview (AI calls, writes nothing) lists every audit whose score changes — old -> new final score,
+      Pass/Fail change, per-category level changes, flags — with a checkbox each (Select all changed / Only increases /
+      none). Apply writes only the selected ones. Refuses to run with unsaved Matrix-page edits, and refuses to apply
+      if the matrix version changed after the preview.
+    - Preserved: all disputes (final score recomputed over approved ones), manual autofails, auditor-edited
+      justifications and comments. CTF tags: the stored ctf_as_scored values, else current Gorgias tags (flagged).
+    - Stamps matrix_version on each re-scored audit. Optional (on by default): reopen reviewed audits whose score or
+      result changes, logged to Reopen History. Every change logged to Reaudit History ("system-matrix-rescore",
+      before/after scores, category changes, matrix versions). Bypasses the Wednesday lock, like the CTF correction.
+
   v3.2.0 (2026-10-01) -- LIVE CTF OPTIONS, PRIORITY FILTERS, ONE-FIELD MANUAL AUDIT, MATRIX + SETTINGS REDESIGN
     - LIVE CTF OPTIONS: Contact Reason / Product / Ticket Resolution / Additional Resolution options now come from
       Gorgias's custom-field definitions (GET /api/gorgias/fields; server caches 1h, keeps the last good copy if a
@@ -899,7 +914,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.2.0";
+const APP_VERSION = "v3.3.0";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -2385,6 +2400,19 @@ function App() {
   const [ctfFixPreview,setCtfFixPreview]=useState(null); // {raise:[],lower:[],same:[],skipped:[],errors:[]}
   const [ctfFixApplying,setCtfFixApplying]=useState(false);
   const ctfFixStopRef = React.useRef(false);
+  // Re-score with current matrix (v3.3.0)
+  const [rsMode,setRsMode]=useState("saved");          // "saved" = scored between dates | "week" = ticket week
+  const [rsFrom,setRsFrom]=useState(function(){ var d=new Date(Date.now()+8*3600000); var dow=(d.getUTCDay()+6)%7; return new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate()-dow)).toISOString().slice(0,10); });
+  const [rsTo,setRsTo]=useState(function(){ return new Date(Date.now()+8*3600000).toISOString().slice(0,10); });
+  const [rsWeek,setRsWeek]=useState("");
+  const [rsOnlyStale,setRsOnlyStale]=useState(true);
+  const [rsReopen,setRsReopen]=useState(true);
+  const [rsRunning,setRsRunning]=useState(false);
+  const [rsApplying,setRsApplying]=useState(false);
+  const [rsStatus,setRsStatus]=useState("");
+  const [rsPreview,setRsPreview]=useState(null);       // {items:[], skipped:[], errors:[], version}
+  const [rsSelected,setRsSelected]=useState({});       // rowId -> true
+  const rsStopRef = React.useRef(false);
   const [unlockReasonInput,setUnlockReasonInput]=useState("");
   const [unlockingTicket,setUnlockingTicket]=useState(false);
 
@@ -4369,6 +4397,167 @@ Rules:
     setCtfFixApplying(false); setCtfFixStatus("");
     setCtfFixPreview(null);
     addToast("CTF correction complete — "+done+" updated"+(approved?", "+approved+" dispute"+(approved!==1?"s":"")+" approved":"")+(failed?", "+failed+" failed":""));
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // RE-SCORE WITH CURRENT MATRIX (v3.3.0)
+  // Re-runs the FULL AI Audit prompt (buildEvalPrompt, same as AI Audit) on already-saved audits using the
+  // matrix currently saved in the database. Built for audits scored while v2 was silently falling back to the
+  // built-in default matrix. Two passes like the CTF correction: Preview (AI calls, writes nothing) -> Apply.
+  // Human work is preserved:
+  //   - approved / rejected / pending disputes are kept exactly; the final score is recomputed on top of them
+  //   - a manually-set autofail (autofailManual) stays an autofail
+  //   - justifications an auditor edited (edited:true) and comments an auditor edited are kept
+  //   - CTF tags: the values stored at scoring time (ctf_as_scored) if present, otherwise the current Gorgias tags
+  // Every change is logged to Reaudit History (type "system-matrix-rescore"). Bypasses the Wednesday lock.
+  // ══════════════════════════════════════════════════════════════════════════
+  function rsThisWeekRange(){
+    var d = new Date(Date.now()+8*3600000);           // Manila date
+    var dow = (d.getUTCDay()+6)%7;                    // Monday = 0
+    var mon = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()-dow));
+    var iso = function(x){ return x.toISOString().slice(0,10); };
+    return {from: iso(mon), to: iso(d)};
+  }
+  function rsEligible(){
+    var cur = matrixVersion;
+    return (tickets||[]).filter(function(t){
+      if(!t.rowId || t.deleted) return false;
+      if(rsMode==="week"){ if(!rsWeek || t.week!==rsWeek) return false; }
+      else {
+        var sd = String(t.savedAt||"").slice(0,10);
+        if(!sd || (rsFrom && sd<rsFrom) || (rsTo && sd>rsTo)) return false;
+      }
+      if(rsOnlyStale && cur!=null && t.matrixVersion===cur) return false;
+      return true;
+    });
+  }
+  async function runRescorePreview(){
+    if(!isFullAccess) return;
+    if(matrixVersion==null){ addToast("Save the matrix first — there is no saved version to re-score with","error"); return; }
+    var dirtyNow = matrixSnapshot!==null && JSON.stringify({m:matrix,a:autofailList,c:scoringContext})!==matrixSnapshot;
+    if(dirtyNow){ addToast("The Matrix page has unsaved changes. Save or discard them first so the re-score uses the saved v"+matrixVersion+".","error"); return; }
+    var list = rsEligible();
+    if(!list.length){ addToast("No audits match that scope","error"); return; }
+    if(!window.confirm("Preview a re-score of "+list.length+" audit"+(list.length!==1?"s":"")+" with matrix v"+matrixVersion+"?\n\nThis makes "+list.length+" AI call"+(list.length!==1?"s":"")+" (about "+Math.ceil(list.length*6/60)+" min). Nothing is saved until you apply.")) return;
+    setRsRunning(true); rsStopRef.current=false; setRsPreview(null); setRsSelected({});
+    var out = {items:[], skipped:[], errors:[], version:matrixVersion};
+    for(var i=0;i<list.length;i++){
+      if(rsStopRef.current){ setRsStatus("Stopped at "+i+" of "+list.length); break; }
+      var t = list[i];
+      setRsStatus("Re-scoring "+(i+1)+" of "+list.length+" — #"+t.ticketId);
+      if(!t.transcript || t.transcript.trim().length<20){ out.skipped.push({t:t, why:"No transcript stored"}); continue; }
+      try {
+        var tags = t.ctfAsScored, tagSource = "as scored";
+        if(!tags || !tags.contactReasonL1){
+          var gt = await gorgiasAPI("/tickets/"+t.ticketId);
+          if(gt && gt._status===429){ await new Promise(function(r){setTimeout(r,20000);}); i--; continue; }
+          if(!gt || gt.error || !gt.id){ out.errors.push({t:t, why:"Gorgias fetch failed (needed for CTF tags)"}); continue; }
+          var cr=parseTicketField(gt,FIELD_CR), pr=parseTicketField(gt,FIELD_PROD), rs=parseTicketField(gt,FIELD_RES), ad=parseTicketField(gt,FIELD_ADDRES);
+          tags = {contactReasonL1:cr[0],contactReasonL2:cr[1],productL1:pr[0],productL2:pr[1],resolutionL1:rs[0],resolutionL2:rs[1],addResolutionL1:ad[0],addResolutionL2:ad[1]};
+          tagSource = "current Gorgias";
+        }
+        var ticketObj = Object.assign({}, t, tags, {
+          contactReason: (tags.contactReasonL1&&tags.contactReasonL2&&tags.contactReasonL2!=="N/A") ? tags.contactReasonL1+"::"+tags.contactReasonL2 : (tags.contactReasonL1||t.contactReason)
+        });
+        var rawTxt = await callClaudeWithRetry(buildEvalPrompt(ticketObj));
+        var cleanTxt = rawTxt.replace(/```(?:json)?\s*/g,"").replace(/```/g,"").trim();
+        var jm = cleanTxt.match(/\{[\s\S]+\}/);
+        if(!jm){ out.errors.push({t:t, why:"No JSON in AI response"}); continue; }
+        var parsed = JSON.parse(jm[0]);
+        var newScores = parsed.scores||{};
+        var sc = calcScore(newScores, matrix);
+        var newPct = sc?sc.pct:0;
+        var aiAutofails = parsed.autofails||[];
+        var autofail = t.autofailManual ? true : aiAutofails.length>0;
+        var disputedRes = calcDisputedScore(Object.assign({}, t, {aiScores:newScores}), matrix);
+        var newFinal = disputedRes ? disputedRes.pct : newPct;
+        var oldFinal = t.finalScore||0;
+        var oldPassed = t.autofail ? false : (t.disputedPassed!==undefined ? t.disputedPassed : oldFinal>=85);
+        var newPassed = !autofail && newFinal>=85;
+        var changed = matrix.map(function(c){
+          var norm = function(v){ v=String(v||"").trim().toUpperCase(); return v===""?"NA":v; };  // blank == NA (not a change)
+          var b=(t.aiScores||{})[c.id]||"", a=newScores[c.id]||"";
+          return norm(b)!==norm(a) ? {id:c.id,label:c.label,before:b||"NA",after:a||"NA"} : null;
+        }).filter(Boolean);
+        var pendingDisputes = Object.keys(t.disputes||{}).filter(function(k){ return (t.disputes[k]||{}).status==="pending"; });
+        out.items.push({t:t, parsed:parsed, newScores:newScores, sc:sc, newPct:newPct, newFinal:newFinal, oldFinal:oldFinal,
+          oldAi:t.aiScore||0, oldPassed:oldPassed, newPassed:newPassed, autofail:autofail, changed:changed, tagSource:tagSource,
+          pendingDisputes:pendingDisputes, reviewed:!!t.reviewed, tags:tags});
+      } catch(e){ out.errors.push({t:t, why:e.message}); }
+      await new Promise(function(r){setTimeout(r,1000);});
+    }
+    var sel = {};
+    out.items.forEach(function(it){ if(it.changed.length || it.newFinal!==it.oldFinal) sel[it.t.rowId]=true; });  // default: everything that changed
+    setRsSelected(sel); setRsPreview(out); setRsStatus(""); setRsRunning(false);
+    var nChanged = out.items.filter(function(it){return it.changed.length||it.newFinal!==it.oldFinal;}).length;
+    addToast("Re-score preview ready — "+nChanged+" of "+out.items.length+" audits change");
+  }
+  async function applyRescore(){
+    if(!isFullAccess || !rsPreview) return;
+    if(rsPreview.version!==matrixVersion){ addToast("The matrix changed since this preview (v"+rsPreview.version+" → v"+matrixVersion+"). Run the preview again.","error"); return; }
+    var toApply = rsPreview.items.filter(function(it){ return rsSelected[it.t.rowId]; });
+    if(!toApply.length){ addToast("Nothing selected"); return; }
+    var down = toApply.filter(function(it){return it.newFinal<it.oldFinal;}).length;
+    var flips = toApply.filter(function(it){return it.oldPassed && !it.newPassed;}).length;
+    if(!window.confirm("Apply the re-score to "+toApply.length+" audit"+(toApply.length!==1?"s":"")+"?\n\n"
+      +(down?down+" score"+(down!==1?"s":"")+" go down"+(flips?", "+flips+" of them from Pass to Fail":"")+".\n":"")
+      +"Scores, justifications, comments and autofails are replaced with the v"+matrixVersion+" re-score (auditor-edited notes, manual autofails and all disputes are kept). "
+      +"This bypasses the Wednesday lock and is logged to each audit's Reaudit History.")) return;
+    setRsApplying(true); rsStopRef.current=false;
+    var done=0, failed=0, reopened=0, nowIso=new Date().toISOString();
+    for(var i=0;i<toApply.length;i++){
+      if(rsStopRef.current){ setRsStatus("Stopped after "+done); break; }
+      var it = toApply[i], t = it.t, p = it.parsed;
+      setRsStatus("Applying "+(i+1)+" of "+toApply.length+" — #"+t.ticketId);
+      try {
+        var oldJ = t.justifications||{}, newJ = p.justifications||{}, justif = {};
+        matrix.forEach(function(c){ justif[c.id] = (oldJ[c.id]&&oldJ[c.id].edited) ? oldJ[c.id] : (newJ[c.id]||oldJ[c.id]||{}); });
+        var nh = {}; try { nh = JSON.parse(t.notesHistoryJSON||"{}"); } catch(e){}
+        var keepComments = !!(nh && nh.comments && nh.comments.some(function(h){ return h && h.by && h.by!=="AI"; }));
+        var prevHist = t.reauditHistory;
+        if(typeof prevHist==="string"){ try { prevHist=JSON.parse(prevHist||"[]"); } catch(e2){ prevHist=[]; } }
+        if(!Array.isArray(prevHist)) prevHist=[];
+        var hist = prevHist.concat([{
+          version: prevHist.length+1, type: "system-matrix-rescore",
+          note: "Re-scored with saved matrix v"+matrixVersion+" (original audit scored with "+(t.matrixVersion?("v"+t.matrixVersion):"an unknown / fallback matrix")+")",
+          matrixVersionBefore: t.matrixVersion||null, matrixVersionAfter: matrixVersion,
+          scoreBefore: it.oldFinal, scoreAfter: it.newFinal, aiScoreBefore: it.oldAi, aiScoreAfter: it.newPct,
+          scoresBefore: t.aiScores||{}, categoryChanges: it.changed, tagSource: it.tagSource,
+          by: currentUser.name, at: nowIso
+        }]);
+        var patch = {
+          scores: it.newScores, aiScore: it.newPct, finalScore: it.newFinal,
+          aiPassed: !it.autofail && it.newPct>=85, finalPassed: it.newPassed,
+          autofail: it.autofail, justifications: justif, reauditHistory: hist,
+          totalPoints: it.sc?it.sc.pts:0, maxPoints: it.sc?it.sc.max:0, matrixVersion: matrixVersion,
+          aiMeta: p.meta ? {product:p.meta.product||"", ticketResolution:p.meta.ticketResolution||""} : undefined
+        };
+        if(!t.autofailManual) patch.autofails = p.autofails||[];
+        if(!keepComments && p.comments) patch.comments = p.comments;
+        if(it.tagSource==="current Gorgias") patch.ctfAsScored = pickCtfTags(it.tags);   // record the tags this re-score used
+        var reopen = rsReopen && it.reviewed && (it.newFinal!==it.oldFinal || it.newPassed!==it.oldPassed);
+        var reopenHist = null;
+        if(reopen){
+          try { reopenHist = JSON.parse(t.reopenHistoryJSON||"[]"); } catch(e3){ reopenHist = []; }
+          reopenHist.push({by:currentUser.name, at:nowIso, reason:"Re-scored with matrix v"+matrixVersion+" ("+it.oldFinal+"% → "+it.newFinal+"%)"});
+          patch.reviewed = false; patch.reopenHistory = JSON.stringify(reopenHist);
+        }
+        Object.keys(patch).forEach(function(k){ if(patch[k]===undefined) delete patch[k]; });
+        await dbPatchTicketRetry(t.rowId, patch, 3);
+        var updated = Object.assign({}, t, {
+          aiScores: it.newScores, scores: it.newScores, aiScore: it.newPct, finalScore: it.newFinal, passed: !it.autofail&&it.newPct>=85,
+          disputedPassed: it.newPassed, autofail: it.autofail, autofails: patch.autofails||t.autofails, justifications: justif,
+          comments: patch.comments||t.comments, reauditHistory: hist, matrixVersion: matrixVersion,
+          reviewed: reopen ? false : t.reviewed, reopenHistoryJSON: reopen ? JSON.stringify(reopenHist) : t.reopenHistoryJSON
+        });
+        setTickets(function(ts){ return ts.map(function(x){ return x.rowId===t.rowId ? updated : x; }); });
+        if(reopen){ reopened++; setReviewedTickets(function(r){ var n=Object.assign({},r); delete n[t.id||t.ticketId]; return n; }); }
+        done++;
+      } catch(e){ failed++; console.error("[Rescore] #"+t.ticketId+" failed:", e.message); }
+      await new Promise(function(r2){setTimeout(r2,300);});
+    }
+    setRsApplying(false); setRsStatus(""); setRsPreview(null); setRsSelected({});
+    addToast("Re-score applied — "+done+" updated"+(reopened?", "+reopened+" reopened for review":"")+(failed?", "+failed+" failed":""), failed?"warning":undefined);
   }
 
   // ── RECALCULATE FINAL PASSED ────────────────────────────────────────────────
@@ -9189,6 +9378,112 @@ Rules:
                         )}
                       </div>
                   )}
+                  {/* Re-score with current matrix — Full access only (v3.3.0) */}
+                  {isFullAccess&&(function(){
+                    var elig = rsEligible();
+                    var busy = rsRunning||rsApplying;
+                    var P = rsPreview;
+                    var changedItems = P ? P.items.filter(function(it){return it.changed.length||it.newFinal!==it.oldFinal;}) : [];
+                    var unchanged = P ? P.items.length-changedItems.length : 0;
+                    var selCount = P ? P.items.filter(function(it){return rsSelected[it.t.rowId];}).length : 0;
+                    var inp = {fontSize:"12px",padding:"6px 8px",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"};
+                    var th = {padding:"6px 8px",textAlign:"left",fontSize:"11px",fontWeight:600,color:"var(--color-text-secondary)",borderBottom:"0.5px solid var(--color-border-tertiary)",whiteSpace:"nowrap"};
+                    var td = {padding:"6px 8px",borderBottom:"0.5px solid var(--color-border-tertiary)",verticalAlign:"top"};
+                    return (
+                    <div style={{border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
+                      <p style={{margin:"0 0 4px",fontSize:"13px",fontWeight:600}}>Re-score with current matrix</p>
+                      <p style={{margin:"0 0 12px",fontSize:"12px",color:"var(--color-text-secondary)",lineHeight:"1.55"}}>
+                        Re-runs the full AI audit on saved audits using the saved matrix{matrixVersion?(" (v"+matrixVersion+")"):""}, exactly like {UI_LABELS.batch}.
+                        Use it for audits scored with the wrong matrix. Disputes, manual autofails and auditor-edited notes are kept; the final score is recalculated on top of approved disputes.
+                        Preview first — nothing is saved until you apply. Every change is logged to the audit's Reaudit History.
+                      </p>
+                      {matrixVersion==null&&<p style={{fontSize:"12px",color:"var(--color-text-danger)",margin:"0 0 10px"}}>No saved matrix yet — save the matrix first.</p>}
+                      <div style={{display:"flex",gap:"16px",alignItems:"flex-end",flexWrap:"wrap",marginBottom:"10px"}}>
+                        <div>
+                          <label style={lbl}>Audits to re-score</label>
+                          <div style={{display:"flex",gap:"12px",fontSize:"12px"}}>
+                            <label style={{display:"flex",gap:"5px",alignItems:"center",cursor:"pointer"}}><input type="radio" checked={rsMode==="saved"} onChange={function(){setRsMode("saved");setRsPreview(null);}}/>Scored between</label>
+                            <label style={{display:"flex",gap:"5px",alignItems:"center",cursor:"pointer"}}><input type="radio" checked={rsMode==="week"} onChange={function(){setRsMode("week");setRsPreview(null);}}/>Ticket week</label>
+                          </div>
+                        </div>
+                        {rsMode==="saved" ? (
+                          <div style={{display:"flex",gap:"6px",alignItems:"center"}}>
+                            <input type="date" value={rsFrom} onChange={function(e){setRsFrom(e.target.value);setRsPreview(null);}} style={inp} aria-label="From"/>
+                            <span style={{fontSize:"12px",color:"var(--color-text-secondary)"}}>to</span>
+                            <input type="date" value={rsTo} onChange={function(e){setRsTo(e.target.value);setRsPreview(null);}} style={inp} aria-label="To"/>
+                          </div>
+                        ) : (
+                          <select value={rsWeek} onChange={function(e){setRsWeek(e.target.value);setRsPreview(null);}} style={inp}>
+                            <option value="">Select week...</option>
+                            {[...new Set(tickets.map(function(t){return t.week;}).filter(Boolean))].sort().reverse().map(function(w){return <option key={w} value={w}>{w}</option>;})}
+                          </select>
+                        )}
+                      </div>
+                      <div style={{display:"flex",gap:"16px",flexWrap:"wrap",fontSize:"12px",marginBottom:"12px"}}>
+                        <label style={{display:"flex",gap:"6px",alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={rsOnlyStale} onChange={function(e){setRsOnlyStale(e.target.checked);setRsPreview(null);}}/>Skip audits already scored with v{matrixVersion||"?"}</label>
+                        <label style={{display:"flex",gap:"6px",alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={rsReopen} onChange={function(e){setRsReopen(e.target.checked);}}/>Reopen reviewed audits whose result changes</label>
+                      </div>
+                      <div style={{display:"flex",gap:"8px",alignItems:"center",marginBottom:"10px",flexWrap:"wrap"}}>
+                        <button onClick={runRescorePreview} disabled={busy||!elig.length||matrixVersion==null}
+                          style={{...btnInfo,fontSize:"12px",opacity:(busy||!elig.length||matrixVersion==null)?0.5:1}}>{rsRunning?"Re-scoring…":"Preview re-score"}</button>
+                        {busy&&<button onClick={function(){rsStopRef.current=true;}} style={{...ghost,fontSize:"12px"}}>Stop</button>}
+                        <span style={{fontSize:"12px",color:"var(--color-text-secondary)"}}>{elig.length} audit{elig.length!==1?"s":""} in scope · {elig.length} AI call{elig.length!==1?"s":""}</span>
+                      </div>
+                      {rsStatus&&<p style={{margin:"0 0 10px",fontSize:"11px",color:"var(--color-text-info)"}}>{rsStatus}</p>}
+                      {P&&(
+                        <div style={{marginTop:"6px"}}>
+                          <div style={{display:"flex",gap:"14px",flexWrap:"wrap",fontSize:"12px",marginBottom:"8px"}}>
+                            <span><strong>{changedItems.length}</strong> change</span>
+                            <span style={{color:"var(--color-text-success)"}}><strong>{changedItems.filter(function(it){return it.newFinal>it.oldFinal;}).length}</strong> go up</span>
+                            <span style={{color:"var(--color-text-danger)"}}><strong>{changedItems.filter(function(it){return it.newFinal<it.oldFinal;}).length}</strong> go down</span>
+                            <span><strong>{P.items.filter(function(it){return !it.oldPassed&&it.newPassed;}).length}</strong> Fail → Pass</span>
+                            <span style={{color:"var(--color-text-danger)"}}><strong>{P.items.filter(function(it){return it.oldPassed&&!it.newPassed;}).length}</strong> Pass → Fail</span>
+                            <span style={{color:"var(--color-text-secondary)"}}><strong>{unchanged}</strong> unchanged</span>
+                            {P.skipped.length>0&&<span style={{color:"var(--color-text-secondary)"}}><strong>{P.skipped.length}</strong> skipped</span>}
+                            {P.errors.length>0&&<span style={{color:"var(--color-text-danger)"}}><strong>{P.errors.length}</strong> errors</span>}
+                          </div>
+                          {changedItems.length>0&&(
+                            <div>
+                              <div style={{display:"flex",gap:"6px",marginBottom:"6px",fontSize:"11px"}}>
+                                <button onClick={function(){var s={};changedItems.forEach(function(it){s[it.t.rowId]=true;});setRsSelected(s);}} style={{...ghost,fontSize:"11px",padding:"3px 10px"}}>Select all changed</button>
+                                <button onClick={function(){var s={};changedItems.forEach(function(it){if(it.newFinal>=it.oldFinal)s[it.t.rowId]=true;});setRsSelected(s);}} style={{...ghost,fontSize:"11px",padding:"3px 10px"}}>Only increases</button>
+                                <button onClick={function(){setRsSelected({});}} style={{...ghost,fontSize:"11px",padding:"3px 10px"}}>Select none</button>
+                              </div>
+                              <div style={{overflowX:"auto",maxHeight:"420px",overflowY:"auto",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-md)"}}>
+                                <table style={{width:"100%",borderCollapse:"collapse",fontSize:"12px"}}>
+                                  <thead style={{position:"sticky",top:0,background:"var(--color-background-secondary)"}}><tr>
+                                    <th style={th}></th><th style={th}>Ticket</th><th style={th}>Agent</th><th style={th}>Final</th><th style={th}>Result</th><th style={th}>Categories changed</th><th style={th}>Notes</th>
+                                  </tr></thead>
+                                  <tbody>{changedItems.map(function(it){
+                                    var up = it.newFinal>it.oldFinal, dn = it.newFinal<it.oldFinal;
+                                    var flags = [];
+                                    if(it.reviewed) flags.push(rsReopen?"reviewed — will reopen":"reviewed");
+                                    if(it.pendingDisputes.length) flags.push(it.pendingDisputes.length+" pending dispute"+(it.pendingDisputes.length!==1?"s":""));
+                                    if(it.t.autofailManual) flags.push("manual autofail kept");
+                                    if(it.tagSource!=="as scored") flags.push("tags from current Gorgias");
+                                    return <tr key={it.t.rowId}>
+                                      <td style={td}><input type="checkbox" checked={!!rsSelected[it.t.rowId]} aria-label={"Apply #"+it.t.ticketId} onChange={function(e){var v=e.target.checked;setRsSelected(function(s){var n=Object.assign({},s);if(v)n[it.t.rowId]=true;else delete n[it.t.rowId];return n;});}}/></td>
+                                      <td style={td}>#{it.t.ticketId}</td>
+                                      <td style={{...td,whiteSpace:"nowrap"}}>{it.t.agentName}</td>
+                                      <td style={{...td,whiteSpace:"nowrap",fontWeight:600,color:up?"var(--color-text-success)":dn?"var(--color-text-danger)":undefined}}>{it.oldFinal}% → {it.newFinal}%</td>
+                                      <td style={{...td,whiteSpace:"nowrap"}}>{it.oldPassed===it.newPassed?(it.newPassed?"Pass":"Fail"):((it.oldPassed?"Pass":"Fail")+" → "+(it.newPassed?"Pass":"Fail"))}</td>
+                                      <td style={td}>{it.changed.map(function(c){return c.label+": "+c.before+" → "+c.after;}).join("; ")||"—"}</td>
+                                      <td style={{...td,color:"var(--color-text-secondary)"}}>{flags.join(" · ")}</td>
+                                    </tr>;
+                                  })}</tbody>
+                                </table>
+                              </div>
+                            </div>
+                          )}
+                          {P.errors.length>0&&<p style={{fontSize:"11px",color:"var(--color-text-danger)",margin:"8px 0 0"}}>Errors: {P.errors.slice(0,8).map(function(e){return "#"+e.t.ticketId+" ("+e.why+")";}).join(", ")}{P.errors.length>8?"…":""}</p>}
+                          <div style={{display:"flex",gap:"8px",marginTop:"12px",alignItems:"center"}}>
+                            <button onClick={applyRescore} disabled={busy||!selCount} style={{...btnInfo,fontSize:"12px",opacity:(busy||!selCount)?0.5:1}}>{rsApplying?"Applying…":("Apply to "+selCount+" selected")}</button>
+                            <button onClick={function(){setRsPreview(null);setRsSelected({});}} disabled={busy} style={{...ghost,fontSize:"12px"}}>Discard preview</button>
+                          </div>
+                        </div>
+                      )}
+                    </div>);
+                  })()}
                 </div>
               )}
             </div>
