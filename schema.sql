@@ -241,3 +241,17 @@ CREATE TABLE IF NOT EXISTS admin_runs (
   summary      JSONB,
   detail       JSONB
 );
+
+-- ── Saved AI insights from the Home dashboard (v3.4.0) ──────────────────────
+CREATE TABLE IF NOT EXISTS insights (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_by   TEXT NOT NULL DEFAULT '',
+  date_from    TEXT NOT NULL DEFAULT '',   -- dashboard filter (ticket date), '' = no bound
+  date_to      TEXT NOT NULL DEFAULT '',
+  audit_count  INTEGER NOT NULL DEFAULT 0,
+  matrix_version INTEGER,
+  content      JSONB NOT NULL,              -- {wentWell:[{headline,detail}], improve:[{headline,detail}]}
+  stats        JSONB                        -- the aggregate numbers the AI was given (for audit/export)
+);
+CREATE INDEX IF NOT EXISTS insights_created_idx ON insights (created_at DESC);

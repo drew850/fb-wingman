@@ -2,10 +2,25 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.3.1
+  Version:  3.4.0
   Date:     2026-10-01
 
   Changelog:
+  v3.4.0 (2026-10-01) -- HOME: CHARTS + AI INSIGHTS
+    - Four charts under the stat cards, all driven by the existing ticket-date filter and using FINAL levels (an approved
+      dispute replaces the AI level): Category scorecard (YES/PARTIAL/NO share per category, weakest called out), Weekly
+      trend (avg final score, final pass rate, AI pass rate, 85% target line; last 12 weeks), Agent x category heatmap
+      (% YES per cell, agents with 3+ audits; Edit/Full only), Contact reason breakdown (volume, avg score, pass rate).
+      Plain SVG/CSS — no chart library, no extra load.
+    - AI insights (Edit/Full only): "Generate insights" sends the filtered period's aggregates plus a sample of the AI's
+      own justifications to the insights model and returns 2-3 "What went well" and 2-3 "What could be done better",
+      written for leadership with the exact counts. Saved to Postgres (new `insights` table) with the stats it was given;
+      a dropdown reopens past runs. Export: Copy for Slack, Download (.md). Full users can delete.
+    - FIX: "Disputed" counted every audit with any dispute record (pending, approved or rejected). Now "Open disputes"
+      (audits with a pending dispute) with approved / rejected counts underneath.
+    - FIX: "By agent" pass rate used the AI pass while the average used the final score. Both now use the same final
+      calculation as the stat cards.
+
   v3.3.1 (2026-10-01) -- Matrix is viewable by every role (View/Agent included), read-only for everyone except Full.
     Only Full users see Edit / Save / Reset; config writes stay Full-only on the server.
 
@@ -917,7 +932,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.3.1";
+const APP_VERSION = "v3.4.0";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -2164,6 +2179,293 @@ const MATRIX_CSS = `
 .wm-mx-bar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
 .wm-mx-dirty{font-size:11px;font-weight:600;padding:2px 9px;border-radius:999px;background:#fffbeb;color:#92400e;border:.5px solid #fde68a}
 `;
+
+// ── HOME DASHBOARD: CHARTS + AI INSIGHTS (v3.4.0) ────────────────────────────
+// All charts use the FINAL level per category (an approved dispute replaces the AI level), so they agree
+// with the Final pass rate / Avg score cards. Plain SVG, Wingman colors, no chart library.
+var DASH_LEVEL_COLORS = {YES:"#1f8a5b", PARTIAL:"#b7791f", NO:"#c53030"};
+function dashLevelOf(t, catId){
+  var d = t.disputes && t.disputes[catId];
+  var raw = (d && d.status==="approved" && d.finalScore) ? d.finalScore : ((t.aiScores||t.scores||{})[catId]);
+  var w = String(raw||"").trim().split(/[\s(]/)[0].toUpperCase();
+  return (w==="YES"||w==="PARTIAL"||w==="NO") ? w : (w ? "NA" : "");
+}
+function dashFinalPct(t, matrix){ var sc = calcDisputedScore(t, matrix); return sc ? sc.pct : (t.finalScore||t.aiScore||0); }
+function dashFinalPassed(t, matrix){ var sc = calcDisputedScore(t, matrix); return sc ? (!t.autofail && sc.pct>=85) : !!t.passed; }
+function dashMonday(dateStr){
+  var s = String(dateStr||"").replace("T"," ").slice(0,10); if(s.length<10) return "";
+  var d = new Date(s+"T00:00:00Z"); if(isNaN(d)) return "";
+  d.setUTCDate(d.getUTCDate()-((d.getUTCDay()+6)%7)); return d.toISOString().slice(0,10);
+}
+function dashShortDate(iso){ var m=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]; var p=String(iso).split("-"); return p.length===3 ? m[+p[1]-1]+" "+(+p[2]) : iso; }
+function dashCrL1(t){ var c = (t.ctfAsScored&&t.ctfAsScored.contactReasonL1) || String(t.contactReason||"").split("::")[0]; c=String(c||"").trim(); return c||"(none)"; }
+function dashCard(title, sub, children){
+  return <div style={{background:"var(--color-background-primary)",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px 18px",marginBottom:"14px"}}>
+    <p style={{margin:"0 0 2px",fontSize:"14px",fontWeight:600}}>{title}</p>
+    {sub&&<p style={{margin:"0 0 12px",fontSize:"12px",color:"var(--color-text-secondary)"}}>{sub}</p>}
+    {children}
+  </div>;
+}
+function dashLegend(items){
+  return <div style={{display:"flex",gap:"14px",flexWrap:"wrap",fontSize:"11px",color:"var(--color-text-secondary)",marginTop:"8px"}}>
+    {items.map(function(it){ return <span key={it[0]} style={{display:"inline-flex",alignItems:"center",gap:"5px"}}>
+      <span style={{width:"10px",height:it[2]==="line"?"3px":"10px",borderRadius:"2px",background:it[1],display:"inline-block",borderTop:it[2]==="dash"?"2px dashed "+it[1]:undefined,backgroundColor:it[2]==="dash"?"transparent":it[1]}}/>{it[0]}</span>; })}
+  </div>;
+}
+
+// 1) Category scorecard — YES / PARTIAL / NO share per matrix category (N/A excluded)
+function CategoryScorecard({tickets, matrix}){
+  var rows = matrix.map(function(c){
+    var n={YES:0,PARTIAL:0,NO:0,NA:0};
+    tickets.forEach(function(t){ var l=dashLevelOf(t,c.id); if(l) n[l]++; });
+    var scored = n.YES+n.PARTIAL+n.NO;
+    return {label:c.label, n:n, scored:scored, pctYes: scored?Math.round(n.YES/scored*100):null};
+  });
+  var weakest = rows.filter(function(r){return r.scored>=5;}).sort(function(a,b){return a.pctYes-b.pctYes;})[0];
+  return dashCard("Category scorecard", "Final level per category across "+tickets.length+" audits (N/A excluded)"+(weakest?(" · weakest: "+weakest.label+" ("+weakest.pctYes+"% YES)"):""),
+    <div>
+      {rows.map(function(r){
+        return <div key={r.label} style={{display:"grid",gridTemplateColumns:"minmax(150px,240px) 1fr 54px",gap:"10px",alignItems:"center",marginBottom:"7px",fontSize:"12px"}}>
+          <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={r.label}>{r.label}</span>
+          <div style={{display:"flex",height:"18px",borderRadius:"4px",overflow:"hidden",background:"var(--color-background-secondary)"}} title={r.label+": "+r.n.YES+" YES · "+r.n.PARTIAL+" PARTIAL · "+r.n.NO+" NO · "+r.n.NA+" N/A"}>
+            {r.scored>0 && ["YES","PARTIAL","NO"].map(function(l){
+              var w = r.n[l]/r.scored*100; if(!w) return null;
+              return <div key={l} style={{width:w+"%",background:DASH_LEVEL_COLORS[l],color:"#fff",fontSize:"10px",fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",overflow:"hidden"}}>{w>=9?r.n[l]:""}</div>;
+            })}
+          </div>
+          <span style={{textAlign:"right",fontWeight:600,color:r.pctYes==null?"var(--color-text-secondary)":r.pctYes>=85?"var(--color-text-success)":r.pctYes>=70?"var(--color-text-warning)":"var(--color-text-danger)"}}>{r.pctYes==null?"—":r.pctYes+"%"}</span>
+        </div>;
+      })}
+      {dashLegend([["YES",DASH_LEVEL_COLORS.YES],["PARTIAL",DASH_LEVEL_COLORS.PARTIAL],["NO",DASH_LEVEL_COLORS.NO],["% = share of scored tickets at YES","transparent"]])}
+    </div>);
+}
+
+// 2) Weekly trend — avg final score, final pass rate, AI pass rate; 85% target line
+function WeeklyTrend({tickets, matrix}){
+  var by = {};
+  tickets.forEach(function(t){ var w=dashMonday(t.createdDate||t.savedAt); if(!w) return; (by[w]=by[w]||[]).push(t); });
+  var weeks = Object.keys(by).sort().slice(-12);
+  if(weeks.length<2) return dashCard("Weekly trend", "Needs at least two weeks of audits in the current filter.", null);
+  var pts = weeks.map(function(w){ var a=by[w];
+    return {w:w, n:a.length,
+      avg: Math.round(a.reduce(function(s,t){return s+dashFinalPct(t,matrix);},0)/a.length),
+      fpass: Math.round(a.filter(function(t){return dashFinalPassed(t,matrix);}).length/a.length*100),
+      apass: Math.round(a.filter(function(t){return t.passed;}).length/a.length*100)}; });
+  var W=760, H=230, L=36, R=26, T=14, B=30;
+  var minY = Math.max(0, Math.floor(Math.min.apply(null, pts.map(function(p){return Math.min(p.avg,p.fpass,p.apass);}).concat([85]))/10)*10-10);
+  var x = function(i){ return L + (W-L-R)*(i/(pts.length-1)); };
+  var y = function(v){ return T + (H-T-B)*(1-(v-minY)/(100-minY)); };
+  var series = [["Avg final score","avg","#1565C0"],["Final pass rate","fpass","#1f8a5b"],["AI pass rate","apass","#9ca3af"]];
+  var ticks=[]; for(var v=minY; v<=100; v+=10) ticks.push(v);
+  return dashCard("Weekly trend", "By ticket week · last "+pts.length+" weeks · hover a point for details",
+    <div style={{overflowX:"auto"}}>
+      <svg viewBox={"0 0 "+W+" "+H} style={{width:"100%",minWidth:"520px",height:"auto",display:"block"}} role="img" aria-label="Weekly score and pass rate trend">
+        {ticks.map(function(v){ return <g key={v}><line x1={L} x2={W-R} y1={y(v)} y2={y(v)} stroke="#e5e7eb" strokeWidth="1"/><text x={L-6} y={y(v)+3} fontSize="10" textAnchor="end" fill="#6b7280">{v}%</text></g>; })}
+        <line x1={L} x2={W-R} y1={y(85)} y2={y(85)} stroke="#c53030" strokeWidth="1.2" strokeDasharray="5 4"/>
+        <text x={W-R} y={y(85)-4} fontSize="10" textAnchor="end" fill="#c53030">85% target</text>
+        {pts.map(function(p,i){ return <text key={p.w} x={x(i)} y={H-10} fontSize="10" textAnchor={i===0?"start":i===pts.length-1?"end":"middle"} fill="#6b7280">{dashShortDate(p.w)}</text>; })}
+        {series.map(function(s){
+          return <g key={s[1]}>
+            <polyline fill="none" stroke={s[2]} strokeWidth={s[1]==="apass"?1.5:2.2} strokeDasharray={s[1]==="apass"?"4 3":undefined} points={pts.map(function(p,i){return x(i)+","+y(p[s[1]]);}).join(" ")}/>
+            {pts.map(function(p,i){ return <circle key={p.w} cx={x(i)} cy={y(p[s[1]])} r="3.2" fill={s[2]}><title>{"Week of "+dashShortDate(p.w)+" ("+p.n+" audits)\nAvg final score: "+p.avg+"%\nFinal pass rate: "+p.fpass+"%\nAI pass rate: "+p.apass+"%"}</title></circle>; })}
+          </g>;
+        })}
+      </svg>
+      {dashLegend([["Avg final score","#1565C0","line"],["Final pass rate","#1f8a5b","line"],["AI pass rate (before disputes)","#9ca3af","line"],["85% pass target","#c53030","dash"]])}
+    </div>);
+}
+
+// 3) Agent × category heatmap — % YES per cell (scored tickets only)
+function AgentCategoryHeatmap({tickets, matrix}){
+  var by = {};
+  tickets.forEach(function(t){ var a=normalizeAgentName(t.agentName||""); if(!a) return; (by[a]=by[a]||[]).push(t); });
+  var agents = Object.keys(by).filter(function(a){return by[a].length>=3;}).map(function(a){
+    var avg = Math.round(by[a].reduce(function(s,t){return s+dashFinalPct(t,matrix);},0)/by[a].length);
+    return {a:a, n:by[a].length, avg:avg};
+  }).sort(function(x,y){return y.avg-x.avg;});
+  if(!agents.length) return dashCard("Agent × category", "Needs at least 3 audits per agent in the current filter.", null);
+  var cell = function(p){ if(p==null) return {bg:"var(--color-background-secondary)",fg:"var(--color-text-secondary)"};
+    if(p>=90) return {bg:"#1f8a5b",fg:"#fff"}; if(p>=80) return {bg:"#5aa67c",fg:"#fff"}; if(p>=70) return {bg:"#e9c46a",fg:"#3d2c00"};
+    if(p>=55) return {bg:"#e08a3c",fg:"#fff"}; return {bg:"#c53030",fg:"#fff"}; };
+  var th = {padding:"6px 6px",fontSize:"10.5px",fontWeight:600,color:"var(--color-text-secondary)",textAlign:"center",verticalAlign:"bottom",lineHeight:"1.25"};
+  return dashCard("Agent × category", "% of scored tickets at YES (final level) · agents with 3+ audits, best average first · hover a cell for counts",
+    <div style={{overflowX:"auto"}}>
+      <table style={{borderCollapse:"separate",borderSpacing:"3px",fontSize:"11.5px",minWidth:"100%"}}>
+        <thead><tr><th style={{...th,textAlign:"left"}}>Agent</th><th style={th}>Avg</th>{matrix.map(function(c){return <th key={c.id} style={{...th,maxWidth:"92px"}}>{c.label}</th>;})}</tr></thead>
+        <tbody>{agents.map(function(r){
+          return <tr key={r.a}>
+            <td style={{whiteSpace:"nowrap",paddingRight:"8px"}}>{r.a} <span style={{color:"var(--color-text-secondary)"}}>({r.n})</span></td>
+            <td style={{textAlign:"center",fontWeight:600}}>{r.avg}%</td>
+            {matrix.map(function(c){
+              var n={YES:0,PARTIAL:0,NO:0}; by[r.a].forEach(function(t){var l=dashLevelOf(t,c.id); if(n[l]!==undefined) n[l]++;});
+              var s=n.YES+n.PARTIAL+n.NO, p=s?Math.round(n.YES/s*100):null, k=cell(p);
+              return <td key={c.id} title={r.a+" · "+c.label+": "+n.YES+" YES, "+n.PARTIAL+" PARTIAL, "+n.NO+" NO"} style={{background:k.bg,color:k.fg,textAlign:"center",fontWeight:600,borderRadius:"4px",padding:"6px 4px",minWidth:"48px"}}>{p==null?"—":p+"%"}</td>;
+            })}
+          </tr>;
+        })}</tbody>
+      </table>
+      {dashLegend([["90%+","#1f8a5b"],["80–89%","#5aa67c"],["70–79%","#e9c46a"],["55–69%","#e08a3c"],["under 55%","#c53030"]])}
+    </div>);
+}
+
+// 4) Contact reason breakdown — volume and average final score per Contact Reason L1
+function ContactReasonChart({tickets, matrix}){
+  var by = {};
+  tickets.forEach(function(t){ var c=dashCrL1(t); (by[c]=by[c]||[]).push(t); });
+  var rows = Object.keys(by).map(function(c){ var a=by[c];
+    return {c:c, n:a.length, avg:Math.round(a.reduce(function(s,t){return s+dashFinalPct(t,matrix);},0)/a.length),
+      pass:Math.round(a.filter(function(t){return dashFinalPassed(t,matrix);}).length/a.length*100)}; })
+    .sort(function(a,b){return b.n-a.n;}).slice(0,12);
+  var max = Math.max.apply(null, rows.map(function(r){return r.n;}).concat([1]));
+  return dashCard("Contact reason breakdown", "Audit volume by Contact Reason (top "+rows.length+") with average final score and pass rate",
+    <div>
+      {rows.map(function(r){
+        var col = r.avg>=90?"#1f8a5b":r.avg>=85?"#5aa67c":r.avg>=75?"#b7791f":"#c53030";
+        return <div key={r.c} style={{display:"grid",gridTemplateColumns:"minmax(130px,200px) 1fr 120px",gap:"10px",alignItems:"center",marginBottom:"7px",fontSize:"12px"}}>
+          <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={r.c}>{r.c}</span>
+          <div style={{height:"16px",background:"var(--color-background-secondary)",borderRadius:"4px"}}>
+            <div style={{width:Math.max(2,r.n/max*100)+"%",height:"100%",background:"#1565C0",opacity:0.85,borderRadius:"4px"}} title={r.n+" audits"}/>
+          </div>
+          <span style={{whiteSpace:"nowrap"}}><strong>{r.n}</strong> · <span style={{color:col,fontWeight:600}}>{r.avg}%</span> · <span style={{color:"var(--color-text-secondary)"}}>{r.pass}% pass</span></span>
+        </div>;
+      })}
+    </div>);
+}
+
+// ── AI insights ──────────────────────────────────────────────────────────────
+function buildInsightStats(list, matrix){
+  var n = list.length;
+  var cats = matrix.map(function(c){ var k={YES:0,PARTIAL:0,NO:0,NA:0}; list.forEach(function(t){var l=dashLevelOf(t,c.id); if(l) k[l]++;});
+    var s=k.YES+k.PARTIAL+k.NO; return {category:c.label, id:c.id, YES:k.YES, PARTIAL:k.PARTIAL, NO:k.NO, NA:k.NA, pctYes: s?Math.round(k.YES/s*100):null}; });
+  var crs = {}; list.forEach(function(t){ var c=dashCrL1(t); var cr2=(t.ctfAsScored&&t.ctfAsScored.contactReasonL2)||String(t.contactReason||"").split("::")[1]||""; var key=c+(cr2?"::"+String(cr2).trim():""); (crs[key]=crs[key]||[]).push(t); });
+  var crRows = Object.keys(crs).map(function(k){ var a=crs[k]; return {contactReason:k, audits:a.length, avgFinal:Math.round(a.reduce(function(s,t){return s+dashFinalPct(t,matrix);},0)/a.length)}; })
+    .sort(function(a,b){return b.audits-a.audits;}).slice(0,15);
+  var disp = {pending:0, approved:0, rejected:0, byCategory:{}};
+  list.forEach(function(t){ Object.keys(t.disputes||{}).forEach(function(cid){ var d=t.disputes[cid]||{}; var st=d.status||"pending";
+    if(disp[st]!==undefined) disp[st]++; var lab=(matrix.find(function(c){return c.id===cid;})||{}).label||cid;
+    var b=disp.byCategory[lab]=disp.byCategory[lab]||{approved:0,rejected:0,pending:0}; if(b[st]!==undefined) b[st]++; }); });
+  var afs = {}; list.forEach(function(t){ (t.autofails||[]).forEach(function(a){ var k=String(a).slice(0,120); afs[k]=(afs[k]||0)+1; }); });
+  return {
+    audits:n, agents: Object.keys(list.reduce(function(m,t){m[t.agentName]=1;return m;},{})).length,
+    avgFinalScore: n?Math.round(list.reduce(function(s,t){return s+dashFinalPct(t,matrix);},0)/n):null,
+    finalPassRate: n?Math.round(list.filter(function(t){return dashFinalPassed(t,matrix);}).length/n*100):null,
+    aiPassRate: n?Math.round(list.filter(function(t){return t.passed;}).length/n*100):null,
+    autofailAudits: list.filter(function(t){return t.autofail;}).length,
+    categories: cats.map(function(c){ var o=Object.assign({},c); delete o.id; return o; }),
+    contactReasons: crRows, disputes: disp,
+    topAutofails: Object.entries(afs).sort(function(a,b){return b[1]-a[1];}).slice(0,6).map(function(e){return {condition:e[0], audits:e[1]};})
+  };
+}
+// Evidence for the AI: the AI's own written justifications, sampled evenly across the period.
+function buildInsightSamples(list, matrix){
+  var out = {};
+  matrix.forEach(function(c){
+    var good=[], bad=[];
+    list.forEach(function(t){ var l=dashLevelOf(t,c.id); var j=(t.justifications||{})[c.id]; var txt=j&&(j.reason||j.r); if(!txt) return;
+      var item = "["+dashCrL1(t)+"] "+String(txt).replace(/\s+/g," ").slice(0,240)+(j.improve&&l!=="YES"?" | improve: "+String(j.improve).replace(/\s+/g," ").slice(0,120):"");
+      if(l==="YES") good.push(item); else if(l==="PARTIAL"||l==="NO") bad.push(l+": "+item); });
+    var pick = function(a,k){ if(a.length<=k) return a; var step=a.length/k, r=[]; for(var i=0;i<k;i++) r.push(a[Math.floor(i*step)]); return r; };
+    if(good.length||bad.length) out[c.label] = {YES:pick(good,5), notYES:pick(bad,7)};
+  });
+  return out;
+}
+function buildInsightPrompt(stats, samples, rangeLabel){
+  return "You are a senior quality analyst for Freebird's customer experience (CX) team. Write insights for the leadership team "
+    +"from this period's QA audit data.\n\nPERIOD: "+rangeLabel+"\n\n"
+    +"AGGREGATE DATA (final levels; an approved dispute replaces the AI's level):\n"+JSON.stringify(stats)+"\n\n"
+    +"EVIDENCE — a sample of the AI auditor's written justifications per category, prefixed with the ticket's contact reason:\n"+JSON.stringify(samples)+"\n\n"
+    +"Write 2 or 3 items for WHAT WENT WELL and 2 or 3 for WHAT COULD BE DONE BETTER.\n"
+    +"Each item: a short headline that names the workflow or skill (e.g. 'Return and refund workflow execution.'), then ONE paragraph "
+    +"(2-4 sentences) that describes the concrete agent behaviours seen in the evidence and backs them with the exact numbers above "
+    +"(e.g. '105 YES versus only 5 PARTIAL or NO'), and says why it matters given the contact-reason mix.\n"
+    +"Rules: use only numbers present in the data; never invent figures. Speak about the team, not individual agents. "
+    +"Pick the patterns with the largest volume or impact. For 'could be done better', be specific about what agents should do differently. "
+    +"Plain, confident, professional English — no hype, no filler.\n\n"
+    +"Respond with ONLY this JSON, no other text:\n"
+    +'{"wentWell":[{"headline":"...","detail":"..."}],"improve":[{"headline":"...","detail":"..."}]}';
+}
+function insightRangeLabel(from, to){ return (from||to) ? ((from?dashShortDate(from)+" "+from.slice(0,4):"start")+" – "+(to?dashShortDate(to)+" "+to.slice(0,4):"today")) : "All time"; }
+function insightToSlack(ins){
+  var c=ins.content||{}, out=["*Team QA insights — "+insightRangeLabel(ins.dateFrom, ins.dateTo)+"* ("+ins.auditCount+" audits)",""];
+  [["What went well",c.wentWell],["What could be done better",c.improve]].forEach(function(sec){ if(!(sec[1]||[]).length) return;
+    out.push("*"+sec[0]+"*"); sec[1].forEach(function(it){ out.push("", "*"+String(it.headline||"").trim()+"*", "• "+String(it.detail||"").trim()); }); out.push(""); });
+  return out.join("\n").trim();
+}
+function insightToMarkdown(ins){
+  var c=ins.content||{}, out=["# Team QA insights — "+insightRangeLabel(ins.dateFrom, ins.dateTo),"",
+    "_"+ins.auditCount+" audits · generated "+new Date(ins.createdAt||Date.now()).toLocaleString()+" by "+(ins.createdBy||"")+(ins.matrixVersion?" · matrix v"+ins.matrixVersion:"")+"_",""];
+  [["What went well",c.wentWell],["What could be done better",c.improve]].forEach(function(sec){ if(!(sec[1]||[]).length) return;
+    out.push("## "+sec[0],""); sec[1].forEach(function(it){ out.push("### "+String(it.headline||"").trim(),"","- "+String(it.detail||"").trim(),""); }); });
+  return out.join("\n");
+}
+
+function InsightsPanel({filtered, matrix, matrixVersion, dashFrom, dashTo, addToast, isFullAccess}){
+  const [current,setCurrent]=useState(null);
+  const [history,setHistory]=useState([]);
+  const [busy,setBusy]=useState(false);
+  const [status,setStatus]=useState("");
+  async function loadHistory(){ try { var d=await apiCall("/insights"); setHistory(d.insights||[]); return d.insights||[]; } catch(e){ return []; } }
+  useEffect(function(){ loadHistory().then(function(h){ if(h.length) setCurrent(function(c){ return c||h[0]; }); }); }, []);
+  async function generate(){
+    if(!filtered.length){ addToast("No audits in the current filter","error"); return; }
+    setBusy(true); setStatus("Analysing "+filtered.length+" audits…");
+    try {
+      var stats = buildInsightStats(filtered, matrix), samples = buildInsightSamples(filtered, matrix);
+      var raw = await callClaudeInsights(buildInsightPrompt(stats, samples, insightRangeLabel(dashFrom, dashTo)));
+      var m = String(raw||"").replace(/```(?:json)?/g,"").match(/\{[\s\S]+\}/);
+      if(!m) throw new Error("The AI didn't return insights — try again");
+      var content = JSON.parse(m[0]);
+      if(!(content.wentWell||[]).length && !(content.improve||[]).length) throw new Error("Empty insights — try again");
+      setStatus("Saving…");
+      var saved = await apiCall("/insights","POST",{dateFrom:dashFrom||"", dateTo:dashTo||"", auditCount:filtered.length, matrixVersion:matrixVersion, content:content, stats:stats});
+      setCurrent(saved); loadHistory(); addToast("Insights generated and saved");
+    } catch(e){ addToast("Insights failed: "+e.message,"error"); }
+    setBusy(false); setStatus("");
+  }
+  async function remove(ins){
+    if(!window.confirm("Delete these saved insights?")) return;
+    try { await apiCall("/insights/"+ins.id,"DELETE"); var h=await loadHistory(); setCurrent(h[0]||null); addToast("Deleted"); } catch(e){ addToast(e.message,"error"); }
+  }
+  function copySlack(){ var txt=insightToSlack(current);
+    (navigator.clipboard&&navigator.clipboard.writeText ? navigator.clipboard.writeText(txt) : Promise.reject()).then(function(){addToast("Copied — paste into Slack");},function(){window.prompt("Copy the text below:", txt);}); }
+  function downloadMd(){ var b=new Blob([insightToMarkdown(current)],{type:"text/markdown;charset=utf-8"}); var u=URL.createObjectURL(b); var a=document.createElement("a");
+    a.href=u; a.download="qa_insights_"+(current.dateFrom||"all")+"_"+(current.dateTo||"")+".md"; document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){URL.revokeObjectURL(u);},1000); }
+  var c = current && current.content;
+  var section = function(title, items, color){ return (items&&items.length) ? <div style={{marginBottom:"12px"}}>
+    <p style={{margin:"0 0 8px",fontSize:"11px",fontWeight:700,letterSpacing:".07em",textTransform:"uppercase",color:color}}>{title}</p>
+    {items.map(function(it,i){ return <div key={i} style={{marginBottom:"10px",paddingLeft:"12px",borderLeft:"3px solid "+color}}>
+      <p style={{margin:"0 0 3px",fontSize:"13px",fontWeight:600}}>{it.headline}</p>
+      <p style={{margin:0,fontSize:"13px",lineHeight:"1.6",color:"var(--color-text-primary)"}}>{it.detail}</p></div>; })}
+  </div> : null; };
+  var ghostS={padding:"5px 12px",borderRadius:"var(--border-radius-md)",border:"0.5px solid var(--color-border-secondary)",background:"transparent",cursor:"pointer",fontSize:"12px",color:"var(--color-text-secondary)"};
+  return dashCard("AI insights", "What went well and what could be done better, written for leadership from the audits in the current filter.",
+    <div>
+      <div style={{display:"flex",gap:"8px",alignItems:"center",flexWrap:"wrap",marginBottom:c?"14px":"0"}}>
+        <button onClick={generate} disabled={busy||!filtered.length} style={{padding:"7px 16px",borderRadius:"var(--border-radius-md)",border:"none",background:"var(--color-background-info)",color:"var(--color-text-info)",fontWeight:600,cursor:"pointer",fontSize:"13px",opacity:(busy||!filtered.length)?0.5:1}}>
+          {busy?"Generating…":"Generate insights"}</button>
+        <span style={{fontSize:"12px",color:"var(--color-text-secondary)"}}>{status||(filtered.length+" audits · "+insightRangeLabel(dashFrom,dashTo))}</span>
+        {history.length>0&&(
+          <select value={current?current.id:""} onChange={function(e){var h=history.find(function(x){return x.id===e.target.value;}); if(h) setCurrent(h);}} style={{marginLeft:"auto",fontSize:"12px",padding:"5px 8px",maxWidth:"320px"}} aria-label="Saved insights">
+            {history.map(function(h){ return <option key={h.id} value={h.id}>{insightRangeLabel(h.dateFrom,h.dateTo)+" · "+h.auditCount+" audits · "+new Date(h.createdAt).toLocaleDateString()}</option>; })}
+          </select>
+        )}
+      </div>
+      {c&&(
+        <div>
+          <p style={{margin:"0 0 12px",fontSize:"11px",color:"var(--color-text-secondary)"}}>
+            {insightRangeLabel(current.dateFrom,current.dateTo)} · {current.auditCount} audits · generated {new Date(current.createdAt).toLocaleString()} by {current.createdBy}{current.matrixVersion?" · matrix v"+current.matrixVersion:""}
+          </p>
+          {section("What went well", c.wentWell, "#1f8a5b")}
+          {section("What could be done better", c.improve, "#b7791f")}
+          <div style={{display:"flex",gap:"8px",flexWrap:"wrap"}}>
+            <button onClick={copySlack} style={ghostS}>Copy for Slack</button>
+            <button onClick={downloadMd} style={ghostS}>Download (.md)</button>
+            {isFullAccess&&<button onClick={function(){remove(current);}} style={{...ghostS,color:"var(--color-text-danger)"}}>Delete</button>}
+          </div>
+        </div>
+      )}
+    </div>);
+}
 
 function allTrue(arr){ var o={}; arr.forEach(function(k){ o[k]=true; }); return o; }
 
@@ -8054,7 +8356,12 @@ Rules:
               {label:"AI pass rate",val:aiPassRate!==null?aiPassRate+"%":"—",tone:aiPassRate},
               {label:"Final pass rate",val:dispPassRate!==null?dispPassRate+"%":"—",tone:dispPassRate},
               {label:"Avg score",val:avgScore!==null?avgScore+"%":"—",tone:avgScore},
-              {label:"Disputed",val:filtered.filter(function(t){return t.hasDisputes||(t.disputes&&Object.keys(t.disputes).length>0);}).length},
+              // v3.4.0: "Disputed" counted any dispute record (pending, approved or rejected). Now: audits with an OPEN
+              // dispute, with the approved / rejected dispute counts underneath.
+              (function(){ var pend=0, appr=0, rej=0;
+                filtered.forEach(function(t){ var ds=Object.values(t.disputes||{}); if(ds.some(function(d){return d&&d.status==="pending";})) pend++;
+                  ds.forEach(function(d){ if(d&&d.status==="approved") appr++; else if(d&&d.status==="rejected") rej++; }); });
+                return {label:"Open disputes", val:pend, sub:appr+" approved · "+rej+" rejected"}; })(),
               {label:"Autofails",val:filtered.filter(function(t){return t.autofail||(t.autofails&&t.autofails.length>0);}).length},
             ];
             return(
@@ -8065,12 +8372,14 @@ Rules:
                     return <div key={m.label} style={{padding:"1rem 1.25rem",borderRight:"0.5px solid var(--color-border-tertiary)",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
                       <div style={{fontSize:"10px",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",color:"var(--color-text-secondary)",marginBottom:"6px"}}>{m.label}</div>
                       <div style={{fontSize:"24px",fontWeight:700,color:tone?tone.text:"var(--color-text-primary)"}}>{m.val}</div>
+                      {m.sub&&<div style={{fontSize:"11px",color:"var(--color-text-secondary)",marginTop:"2px"}}>{m.sub}</div>}
                     </div>;
                   })}
                 </div>
                 <div style={{display:"flex",justifyContent:"flex-end",marginBottom:"12px",gap:"8px"}}>
-                  <button onClick={function(){setView("batch");}} style={btnInfo}>New batch QA</button>
+                  {isEditor&&<button onClick={function(){setView("batch");}} style={btnInfo}>New {UI_LABELS.batch}</button>}{/* v3.4.0: UI label (was "New batch QA"); Edit/Full only */}
                   <button onClick={exportAllCSV} style={ghost}>Export all CSV</button>
+                  {isEditor&&(
                   <button onClick={function(){
                     var seen={};var deduped=[];var removed=0;
                     var sorted=[...tickets].sort(function(a,b){return (b.savedAt||"").localeCompare(a.savedAt||"");});
@@ -8080,6 +8389,7 @@ Rules:
                       setTickets(deduped);addToast("Removed "+removed+" duplicate"+(removed!==1?"s":""));
                     }
                   }} style={{...ghost,color:"var(--color-text-danger)"}}>Remove duplicates</button>
+                  )}
                 </div>
                 {filtered.length===0?(
                   <div style={{...card,textAlign:"center",padding:"3rem 2rem"}}>
@@ -8088,13 +8398,19 @@ Rules:
                   </div>
                 ):(
                   <div>
+                    {/* v3.4.0: AI insights (Edit/Full) + charts, all driven by the date filter above */}
+                    {isEditor&&<InsightsPanel filtered={filtered} matrix={matrix} matrixVersion={matrixVersion} dashFrom={dashFrom} dashTo={dashTo} addToast={addToast} isFullAccess={isFullAccess}/>}
+                    <CategoryScorecard tickets={filtered} matrix={matrix}/>
+                    <WeeklyTrend tickets={filtered} matrix={matrix}/>
+                    {isEditor&&<AgentCategoryHeatmap tickets={filtered} matrix={matrix}/>}
+                    <ContactReasonChart tickets={filtered} matrix={matrix}/>
                     {agents.filter(function(a){return filtered.some(function(t){return t.agentName===a;});}).length>0&&(
                       <div style={{...card,marginBottom:"14px"}}>
                         <p style={{margin:"0 0 12px",fontWeight:500,fontSize:"14px"}}>By agent{(dashFrom||dashTo)?" (filtered)":""}</p>
                         {agents.filter(function(a){return filtered.some(function(t){return t.agentName===a;});}).map(function(a){
                           var ats=filtered.filter(function(t){return t.agentName===a;});
-                          var avg=Math.round(ats.reduce(function(s,t){return s+t.finalScore;},0)/ats.length);
-                          var passRate=Math.round(ats.filter(function(t){return t.passed;}).length/ats.length*100);
+                          var avg=Math.round(ats.reduce(function(s,t){return s+dashFinalPct(t,matrix);},0)/ats.length); // v3.4.0: same calc as the Avg score card
+                          var passRate=Math.round(ats.filter(function(t){return dashFinalPassed(t,matrix);}).length/ats.length*100); // v3.4.0: final pass (was AI pass), matches the Final pass rate card
                           var tone=scoreTone(avg);
                           return <div key={a} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:"0.5px solid var(--color-border-tertiary)"}}>
                             <span style={{fontSize:"13px",fontWeight:500}}>{a}</span>

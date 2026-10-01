@@ -1,4 +1,4 @@
-# Wingman server — v3.2.0
+# Wingman server — v3.4.0
 # Storage: Postgres (DATABASE_URL). Notion is used ONLY by the one-time import + verify
 # jobs under /api/admin/*, server-side, and is never proxied for the browser.
 import os, json, re, urllib.request, urllib.error, secrets, hashlib, time, threading, queue, base64, traceback, uuid
@@ -16,7 +16,7 @@ except Exception as _imp_err:  # server still boots and reports the problem on /
     psycopg = None
     _PSYCOPG_IMPORT_ERROR = str(_imp_err)
 
-SERVER_VERSION      = "3.2.0"
+SERVER_VERSION      = "3.4.0"
 HTML_FILE           = "Wingman.html"
 PORT                = int(os.environ.get("PORT", 3747))
 DIR                 = os.path.dirname(os.path.abspath(__file__))
@@ -1866,6 +1866,40 @@ def api_admin_snapshot_retry(h, user, pp, qs, body):
 def api_gorgias_fields(h, user, pp, qs, body):
     return get_ctf_field_options(force=(qs.get("refresh") == "1" and role_rank(user["role"]) >= 2))
 
+# ── Saved dashboard insights (v3.4.0) — Edit/Full only ─────────────────────────
+def _insight_api(r, full=True):
+    out = {"id": str(r["id"]), "createdAt": r["created_at"].isoformat(), "createdBy": r["created_by"],
+           "dateFrom": r["date_from"], "dateTo": r["date_to"], "auditCount": r["audit_count"],
+           "matrixVersion": r["matrix_version"]}
+    if full:
+        out["content"] = r["content"]; out["stats"] = r.get("stats")
+    return out
+
+def api_insights_list(h, user, pp, qs, body):
+    rows = db_all("SELECT id, created_at, created_by, date_from, date_to, audit_count, matrix_version, content FROM insights ORDER BY created_at DESC LIMIT 100")
+    return {"insights": [_insight_api(r) for r in rows]}   # list omits the stats payload
+
+def api_insight_get(h, user, pp, qs, body):
+    if not is_uuid(pp["id"]): raise ApiError(404, "insight not found")
+    r = db_one("SELECT * FROM insights WHERE id=%s", (pp["id"],))
+    if not r: raise ApiError(404, "insight not found")
+    return _insight_api(r)
+
+def api_insight_create(h, user, pp, qs, body):
+    content = body.get("content")
+    if not isinstance(content, dict) or not (content.get("wentWell") or content.get("improve")):
+        raise ApiError(400, "content with wentWell/improve required")
+    r = db_one("""INSERT INTO insights (created_by, date_from, date_to, audit_count, matrix_version, content, stats)
+                  VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+               (user["name"], c_text(body.get("dateFrom")), c_text(body.get("dateTo")), c_int(body.get("auditCount")) or 0,
+                c_int(body.get("matrixVersion")), Jsonb(content), Jsonb(body.get("stats")) if body.get("stats") is not None else None))
+    return _insight_api(r)
+
+def api_insight_delete(h, user, pp, qs, body):
+    if not is_uuid(pp["id"]): raise ApiError(404, "insight not found")
+    db_exec("DELETE FROM insights WHERE id=%s", (pp["id"],))
+    return {"ok": True}
+
 UUID_RX = r"(?P<id>[0-9a-fA-F-]{32,36})"
 KEY_RX  = r"(?P<key>[A-Za-z0-9_.\-]+)"
 # (method, path regex, fn, min role rank, is_write).  Writes are refused until cutover.
@@ -1894,6 +1928,10 @@ ROUTES = [
     ("GET",    r"/calib/reviews",                     api_reviews_list,         1, False),
     ("POST",   r"/calib/reviews",                     api_reviews_create,       1, True),
     ("PATCH",  r"/calib/reviews/" + UUID_RX,          api_review_patch,         1, True),
+    ("GET",    r"/insights",                          api_insights_list,        1, False),
+    ("POST",   r"/insights",                          api_insight_create,       1, True),
+    ("GET",    r"/insights/" + UUID_RX,               api_insight_get,          1, False),
+    ("DELETE", r"/insights/" + UUID_RX,               api_insight_delete,       2, True),
     ("GET",    r"/admin/status",                      api_admin_status,         2, False),
     ("POST",   r"/admin/import",                      api_admin_import,         2, False),
     ("POST",   r"/admin/verify",                      api_admin_verify,         2, False),
