@@ -2,10 +2,22 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.4.0
+  Version:  3.5.0
   Date:     2026-10-01
 
   Changelog:
+  v3.5.0 (2026-10-01) -- AUTOFAIL = 0%
+    - An autofailed audit now scores 0% (AI score and final score), so autofails pull averages down everywhere: Home
+      cards, charts, By agent, reports, insights, exports. Pass rates are unchanged (autofail was already always Fail).
+    - Applied at the source: calcDisputedScore() returns 0% for autofails (rubricPct keeps the category total for
+      context); audits load with 0%; every scoring path saves 0% (AI Audit, re-audit, Manual Audit, Delete & Replace,
+      re-score tool, CTF correction). Category levels are untouched, so the category charts still show how the ticket
+      was scored.
+    - Adding a manual autofail sets 0%; removing one restores the real score from the category levels (and now also
+      corrects Final Passed, which removal previously left unchanged).
+    - Review shows an "Autofail 0%" box with the rubric score underneath ("what the categories add up to").
+    - One-time server migration zeroes already-saved autofailed audits so the database matches the app.
+
   v3.4.0 (2026-10-01) -- HOME: CHARTS + AI INSIGHTS
     - Four charts under the stat cards, all driven by the existing ticket-date filter and using FINAL levels (an approved
       dispute replaces the AI level): Category scorecard (YES/PARTIAL/NO share per category, weakest called out), Weekly
@@ -932,7 +944,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.4.0";
+const APP_VERSION = "v3.5.0";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -1270,8 +1282,12 @@ function parseTicketRow(r) {
   const ticketId  = r.ticketId  || r["Ticket ID"]  || r.title || "";
   const agentName = normalizeAgentName(r.agentName || r["Agent"]       || r.agent || "");
   const reviewer  = r.reviewer  || r["Auditor"]     || r.auditor || "";
-  const aiScore   = parseFloat(r.aiScore    ?? r["AI Score"]    ?? 0) || 0;
-  const finalScore= parseFloat(r.finalScore ?? r["Final Score"] ?? aiScore) || 0;
+  const aiScoreRaw = parseFloat(r.aiScore    ?? r["AI Score"]    ?? 0) || 0;
+  const finalScoreRaw = parseFloat(r.finalScore ?? r["Final Score"] ?? aiScoreRaw) || 0;
+  const isAutofail = !!(r.autofail ?? r["Autofail"] ?? false);
+  const aiScore    = isAutofail ? 0 : aiScoreRaw;      // v3.5.0: autofail = 0%
+  const finalScore = isAutofail ? 0 : finalScoreRaw;
+  const rubricScore = finalScoreRaw || aiScoreRaw;     // what the categories add up to (shown as context on autofails)
   return {
     id: r.pageId || r.id || ticketId,
     rowId: r.pageId || r.id || null,
@@ -1285,6 +1301,7 @@ function parseTicketRow(r) {
     ticketUrl:     r.ticketUrl    || r["Ticket URL"]    || "",
     aiScore,
     finalScore,
+    rubricScore,       // v3.5.0: category total before the autofail zero (context only)
     passed:         !!(r.aiPassed    ?? r["AI Passed"]    ?? false),
     disputedPassed: !!(r.finalPassed ?? r["Final Passed"] ?? false),
     hasDisputes:    !!(r.hasDisputes ?? r["Has Disputes"] ?? false),
@@ -1611,7 +1628,10 @@ function calcDisputedScore(ticket, matrix) {
     var score = useDispute ? normalizeDisputeScore(d.finalScore, c) : ((ticket.aiScores && ticket.aiScores[c.id]) || "");
     merged[c.id] = score;
   });
-  return calcScore(merged, matrix);
+  var res = calcScore(merged, matrix);
+  // v3.5.0: an autofailed audit scores 0%. rubricPct keeps what the categories add up to, for context only.
+  if (res && ticket.autofail) return Object.assign({}, res, { pct: 0, rubricPct: res.pct, autofail: true });
+  return res;
 }
 function scoreLabel(val) {
   if (!val || val === "NA") return null;
@@ -3125,8 +3145,8 @@ function App() {
       comments:      parsed.comments||"",
       totalPoints:   sc?sc.pts:0,
       maxPoints:     sc?sc.max:0,
-      finalScore:    sc?sc.pct:0,
-      aiScore:       sc?sc.pct:0,
+      finalScore:    (hasAF?0:(sc?sc.pct:0)) /* v3.5.0: autofail = 0% */,
+      aiScore:       (hasAF?0:(sc?sc.pct:0)),
       passed:        !hasAF&&(sc?sc.pct:0)>=85,
       hasDisputes:   false,
       disputes:      {},
@@ -3251,8 +3271,8 @@ function App() {
           comments:      parsed.comments||"",
           totalPoints:   sc?sc.pts:0,
           maxPoints:     sc?sc.max:0,
-          finalScore:    sc?sc.pct:0,
-          aiScore:       sc?sc.pct:0,
+          finalScore:    (hasAF?0:(sc?sc.pct:0)) /* v3.5.0: autofail = 0% */,
+          aiScore:       (hasAF?0:(sc?sc.pct:0)),
           passed:        !hasAF&&(sc?sc.pct:0)>=85,
           hasDisputes:   false,
           disputes:      {},
@@ -3529,7 +3549,7 @@ function App() {
           autofails:parsed.autofails||[],autofail:hasAF,
           comments:parsed.comments||"",
           totalPoints:sc?sc.pts:0,maxPoints:sc?sc.max:0,
-          finalScore:sc?sc.pct:0,aiScore:sc?sc.pct:0,
+          finalScore:(hasAF?0:(sc?sc.pct:0)) /* v3.5.0: autofail = 0% */,aiScore:(hasAF?0:(sc?sc.pct:0)),
           passed:!hasAF&&(sc?sc.pct:0)>=85,
           hasDisputes:false,disputes:{},
           justifications:parsed.justifications||{},
@@ -4471,9 +4491,13 @@ Rules:
       await dbPatchTicket(ticket.rowId,{
         autofail:      true,
         autofails:     [condition],
+        aiScore:       0,              // v3.5.0: autofail = 0%
+        finalScore:    0,
+        finalPassed:   false,
         reviewerNotes: "AUTOFAIL: "+autofailReason
       });
-      var updated = Object.assign({},ticket,{autofail:true,autofails:[condition]});
+      var updated = Object.assign({},ticket,{autofail:true,autofails:[condition],aiScore:0,finalScore:0,disputedPassed:false,
+        rubricScore: ticket.autofail ? ticket.rubricScore : (ticket.finalScore||ticket.rubricScore||0)});
       setTickets(function(ts){return ts.map(function(t){return t.rowId===ticket.rowId?updated:t;});});
       setReviewSelected(updated);
       setAutofailPrompt(false);
@@ -4490,12 +4514,20 @@ Rules:
     setSavingAutofail(true);
     try {
       var now = new Date().toISOString();
+      // v3.5.0: restore the real score (it was 0% while autofailed)
+      var restored = calcDisputedScore(Object.assign({},ticket,{autofail:false}), matrix);
+      var aiRestored = calcScore(ticket.aiScores||{}, matrix);
+      var finalPct = restored ? restored.pct : (ticket.rubricScore||0);
+      var aiPct = aiRestored ? aiRestored.pct : (ticket.rubricScore||0);
       await dbPatchTicket(ticket.rowId,{
         autofail:      false,
         autofails:     [],
+        aiScore:       aiPct,
+        finalScore:    finalPct,
+        finalPassed:   finalPct>=85,
         reviewerNotes: "AUTOFAIL REMOVED: "+reason.trim()+" -- "+currentUser.name+" "+now.slice(0,10)
       });
-      var updated = Object.assign({},ticket,{autofail:false,autofails:[]});
+      var updated = Object.assign({},ticket,{autofail:false,autofails:[],aiScore:aiPct,finalScore:finalPct,disputedPassed:finalPct>=85});
       setTickets(function(ts){return ts.map(function(t){return t.rowId===ticket.rowId?updated:t;});});
       setReviewSelected(updated);
       setRemoveAutofailPrompt(false);
@@ -4642,7 +4674,7 @@ Rules:
       try {
         var newScores = Object.assign({}, t.aiScores||{}, {ctf:r.newLevel});
         var sc = calcScore(newScores, matrix);
-        var newPct = sc?sc.pct:0;
+        var newPct = t.autofail ? 0 : (sc?sc.pct:0);   // v3.5.0: autofail = 0%
         var newPassed = !t.autofail && newPct>=85;
 
         // A pending CTF dispute the re-run now supports gets auto-approved.
@@ -4771,10 +4803,10 @@ Rules:
         var parsed = JSON.parse(jm[0]);
         var newScores = parsed.scores||{};
         var sc = calcScore(newScores, matrix);
-        var newPct = sc?sc.pct:0;
         var aiAutofails = parsed.autofails||[];
         var autofail = t.autofailManual ? true : aiAutofails.length>0;
-        var disputedRes = calcDisputedScore(Object.assign({}, t, {aiScores:newScores}), matrix);
+        var newPct = autofail ? 0 : (sc?sc.pct:0);      // v3.5.0: autofail = 0%
+        var disputedRes = calcDisputedScore(Object.assign({}, t, {aiScores:newScores, autofail:autofail}), matrix);
         var newFinal = disputedRes ? disputedRes.pct : newPct;
         var oldFinal = t.finalScore||0;
         var oldPassed = t.autofail ? false : (t.disputedPassed!==undefined ? t.disputedPassed : oldFinal>=85);
@@ -5804,7 +5836,7 @@ Rules:
         product: (parsed.meta&&parsed.meta.product)||"", ticketResolution: (parsed.meta&&parsed.meta.ticketResolution)||"",
         scores: parsed.scores||{}, aiScores: parsed.scores||{}, autofails: parsed.autofails||[], autofail: hasAF,
         comments: parsed.comments||"", totalPoints: sc?sc.pts:0, maxPoints: sc?sc.max:0,
-        finalScore: sc?sc.pct:0, aiScore: sc?sc.pct:0, passed: !hasAF&&(sc?sc.pct:0)>=85,
+        finalScore: (hasAF?0:(sc?sc.pct:0)) /* v3.5.0: autofail = 0% */, aiScore: (hasAF?0:(sc?sc.pct:0)), passed: !hasAF&&(sc?sc.pct:0)>=85,
         hasDisputes: false, disputes: {}, justifications: parsed.justifications||{},
         customerEmail: ticket.customerEmail, savedAt: new Date().toISOString(), transcript: ticket.transcript||"",
         messageCount: ticket.messageCount||0, agentMessageCount: ticket.agentMessageCount||0,
@@ -7223,6 +7255,12 @@ Rules:
                         <div style={{fontSize:"22px",fontWeight:700,color:dispTone.text}}>{dispSc?dispSc.pct:(reviewSelected.aiScore||reviewSelected.finalScore)}%</div>
                         <div style={{fontSize:"10px",color:dispTone.text,marginTop:"2px"}}>{dispPassed?"Pass":"Fail"}</div>
                       </div>
+                      {/* v3.5.0: autofail = 0%; show what the categories would have added up to, for context */}
+                      {reviewSelected.autofail&&<div style={{padding:"10px 16px",borderRadius:"var(--border-radius-md)",background:T.red.bg,textAlign:"center",minWidth:"80px",border:"1px solid "+T.red.border}}>
+                        <div style={{fontSize:"10px",color:T.red.text,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:"4px"}}>Autofail</div>
+                        <div style={{fontSize:"22px",fontWeight:700,color:T.red.text}}>0%</div>
+                        <div style={{fontSize:"10px",color:T.red.text,marginTop:"2px"}} title="What the category scores add up to without the autofail">rubric {(dispSc&&dispSc.rubricPct!=null)?dispSc.rubricPct:(reviewSelected.rubricScore||0)}%</div>
+                      </div>}
                       {reviewSelected.hasDisputes&&<div style={{padding:"10px 16px",borderRadius:"var(--border-radius-md)",background:T.amber.bg,textAlign:"center",minWidth:"80px"}}>
                         <div style={{fontSize:"10px",color:T.amber.text,fontWeight:700,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:"4px"}}>Disputes</div>
                         <div style={{fontSize:"22px",fontWeight:700,color:T.amber.text}}>{Object.keys(reviewSelected.disputes||{}).length}</div>

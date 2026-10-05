@@ -1,4 +1,4 @@
-# Wingman server — v3.4.0
+# Wingman server — v3.5.0
 # Storage: Postgres (DATABASE_URL). Notion is used ONLY by the one-time import + verify
 # jobs under /api/admin/*, server-side, and is never proxied for the browser.
 import os, json, re, urllib.request, urllib.error, secrets, hashlib, time, threading, queue, base64, traceback, uuid
@@ -16,7 +16,7 @@ except Exception as _imp_err:  # server still boots and reports the problem on /
     psycopg = None
     _PSYCOPG_IMPORT_ERROR = str(_imp_err)
 
-SERVER_VERSION      = "3.4.0"
+SERVER_VERSION      = "3.5.0"
 HTML_FILE           = "Wingman.html"
 PORT                = int(os.environ.get("PORT", 3747))
 DIR                 = os.path.dirname(os.path.abspath(__file__))
@@ -279,6 +279,18 @@ def db_init():
         POOL = None
         DB_ERROR = f"{type(e).__name__}: {e}"
         print(f"[DB] INIT FAILED: {DB_ERROR}")
+
+def migrate_autofail_zero():
+    """v3.5.0 one-time migration: autofailed audits score 0%. Category scores (scores jsonb) and total_points are
+    untouched, so the rubric % is always recoverable. Marked done in app_state so it runs once."""
+    if POOL is None or (state_get("migration_autofail_zero") or {}).get("done"):
+        return 0
+    n = db_exec("""UPDATE tickets SET ai_score = 0, final_score = 0, final_passed = false,
+                       updated_at = now(), app_updated_at = now()
+                   WHERE autofail AND (COALESCE(ai_score, 0) <> 0 OR COALESCE(final_score, 0) <> 0 OR final_passed)""")
+    state_set("migration_autofail_zero", {"done": True, "at": now_iso(), "rows": n})
+    print(f"[Migration] autofail = 0%: {n} audit(s) updated")
+    return n
 
 def db_all(sql, params=None):
     with POOL.connection() as conn:
@@ -2330,6 +2342,7 @@ if __name__ == "__main__":
     if POOL is not None:
         print(f"Cutover: {cutover_state()}")
         print(f"Snapshots requeued: {requeue_pending_snapshots()}")
+        migrate_autofail_zero()
     threading.Thread(target=snapshot_worker, daemon=True).start()
     threading.Thread(target=get_ctf_field_options, daemon=True).start()   # warm the live CTF option cache
     Server(("0.0.0.0", PORT), Handler).serve_forever()
