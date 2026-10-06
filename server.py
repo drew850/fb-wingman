@@ -1,4 +1,4 @@
-# Wingman server — v3.5.0
+# Wingman server — v3.6.0
 # Storage: Postgres (DATABASE_URL). Notion is used ONLY by the one-time import + verify
 # jobs under /api/admin/*, server-side, and is never proxied for the browser.
 import os, json, re, urllib.request, urllib.error, secrets, hashlib, time, threading, queue, base64, traceback, uuid
@@ -16,7 +16,7 @@ except Exception as _imp_err:  # server still boots and reports the problem on /
     psycopg = None
     _PSYCOPG_IMPORT_ERROR = str(_imp_err)
 
-SERVER_VERSION      = "3.5.0"
+SERVER_VERSION      = "3.6.0"
 HTML_FILE           = "Wingman.html"
 PORT                = int(os.environ.get("PORT", 3747))
 DIR                 = os.path.dirname(os.path.abspath(__file__))
@@ -1650,9 +1650,24 @@ def api_ticket_create(h, user, pp, qs, body):
         enqueue_snapshot(r["id"])
     return {"id": str(r["id"])}
 
+def _check_agent_disputes(existing, incoming):
+    """v3.6.0: agents may only ADD new disputes, and only as pending. Existing disputes (including decided ones) are
+    read-only to them, so an agent can't approve their own dispute or rewrite an auditor's decision."""
+    if not isinstance(incoming, dict): raise ApiError(400, "disputes must be an object")
+    existing = existing or {}
+    for k, v in existing.items():
+        if k not in incoming or not strict_equal(incoming[k], v):
+            raise ApiError(403, "existing disputes can't be changed")
+    for k, v in incoming.items():
+        if k in existing: continue
+        if not isinstance(v, dict) or (v.get("status") or "pending") != "pending" or v.get("decidedBy"):
+            raise ApiError(403, "new disputes must be pending")
+
 def api_ticket_patch(h, user, pp, qs, body):
     scope = _agent_scope(user)
-    _ticket_or_404(pp["id"], scope)
+    row = _ticket_or_404(pp["id"], scope)
+    if scope is not None and "disputes" in body:
+        _check_agent_disputes(row["disputes"], c_json(body["disputes"], {}))
     cols = ticket_payload_to_cols(body, allowed=AGENT_WRITABLE if scope is not None else None)
     if not cols: return {"ok": True}
     sets = ", ".join(f"{c}=%s" for c in cols)
