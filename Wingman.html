@@ -2,10 +2,23 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.6.1
-  Date:     2026-10-13
+  Version:  3.7.0
+  Date:     2026-10-08
 
   Changelog:
+  v3.7.0 (2026-10-08) -- AUTOFAIL DISPUTE WINDOW
+    - Admin Tools > "Autofail dispute window" (Full only): opens autofail disputes on audits that are already locked,
+      until an end date (default 4 weeks; closes itself, Manila date), optionally limited to a ticket-date range
+      (default: all past autofails). Only AUTOFAIL disputes reopen — category scores and category disputes stay locked.
+      Opening / updating / closing is logged (who, when, range) and shown as History in the panel.
+    - Agents can file "Dispute autofail" on covered locked audits; auditors can approve / reject them while the window
+      is open. Disputes filed or decided this way are tagged viaWindow / decidedViaWindow.
+    - Home banner while the window is open (agents: how to dispute; auditors: autofail disputes waiting) with a
+      "Show autofailed audits" shortcut. New "Autofailed only" filter in Review Audits.
+    - Server: GET/PUT /api/settings/autofail-window (PUT Full only); window state also returned by /api/me.
+    - Category "Dispute" buttons are hidden on locked audits (saving was already refused there; the button was misleading).
+    - Note: the date in the v3.6.1 entry below was mistyped as 2026-10-13; it shipped 2026-10-08.
+
   v3.6.1 (2026-10-13) -- FIX: FALSE AUTOFAILS + REVIEW CRASH (React error #31, e.g. ticket 464539800)
     - Root cause: the scoring prompt's schema was just "autofails":[], and the AI sometimes returned EVERY condition
       with a verdict ([{fail:false, description:"..."}]). Any non-empty list counted as an autofail, so tickets where
@@ -975,7 +988,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.6.1";
+const APP_VERSION = "v3.7.0";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -2561,6 +2574,71 @@ function normalizeAutofails(arr){
   var out=[]; arr.forEach(function(a){ if(autofailApplies(a)){ var t=autofailText(a); if(t && out.indexOf(t)===-1) out.push(t); } });
   return out;
 }
+// ── AUTOFAIL DISPUTE WINDOW (v3.7.0) — Admin Tools panel, Full only ────────────
+function manilaTodayISO(){ return new Date(Date.now()+8*3600000).toISOString().slice(0,10); }
+function addDaysISO(iso, n){ var d=new Date(iso+"T00:00:00Z"); d.setUTCDate(d.getUTCDate()+n); return d.toISOString().slice(0,10); }
+function fmtDay(iso){ if(!iso) return ""; var d=new Date(iso+"T00:00:00Z"); return d.toLocaleDateString(undefined,{month:"short",day:"numeric",year:"numeric",timeZone:"UTC"}); }
+function AutofailWindowPanel({addToast, value, onChange}){
+  var w = value || {};
+  const [until,setUntil]=useState(w.open&&w.until ? w.until : addDaysISO(manilaTodayISO(), 28));
+  const [from,setFrom]=useState(w.from||"");
+  const [to,setTo]=useState(w.to||"");
+  const [busy,setBusy]=useState(false);
+  useEffect(function(){ if(w.open&&w.until){ setUntil(w.until); setFrom(w.from||""); setTo(w.to||""); } }, [w.open, w.until, w.from, w.to]);
+  async function save(open){
+    if(open && !window.confirm((w.active?"Update":"Open")+" the autofail dispute window until "+fmtDay(until)+"?\n\nAgents will be able to dispute autofails on locked audits "+(from||to?("from "+(from?fmtDay(from):"the start")+" to "+(to?fmtDay(to):"now")):"of any date")+". Category scores stay locked.")) return;
+    if(!open && !window.confirm("Close the autofail dispute window now? Disputes already filed stay in the queue; auditors can still decide them only while the audit is unlocked.")) return;
+    setBusy(true);
+    try { var r = await apiCall("/settings/autofail-window","PUT",{open:open, until:until, from:from, to:to}); onChange(r); addToast(open?("Autofail dispute window open until "+fmtDay(r.until)):"Autofail dispute window closed"); }
+    catch(e){ addToast(e.message,"error"); }
+    setBusy(false);
+  }
+  var inp={fontSize:"13px"};
+  var status = w.active ? {t:"Open until "+fmtDay(w.until), bg:"var(--color-background-success)", c:"var(--color-text-success)"}
+             : (w.open ? {t:"Expired "+fmtDay(w.until), bg:"var(--color-background-secondary)", c:"var(--color-text-secondary)"}
+                       : {t:"Closed", bg:"var(--color-background-secondary)", c:"var(--color-text-secondary)"});
+  return (
+    <div style={{border:"1px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:"12px",flexWrap:"wrap"}}>
+        <div>
+          <p style={{margin:"0 0 4px",fontSize:"13px",fontWeight:600}}>Autofail dispute window</p>
+          <p style={{margin:0,fontSize:"12px",color:"var(--color-text-secondary)",lineHeight:"1.55",maxWidth:"60ch"}}>
+            Temporarily lets agents dispute autofails on audits that are already locked, and lets auditors approve or reject them.
+            Only autofail disputes reopen — category scores and category disputes stay locked. Closes itself on the end date.
+          </p>
+        </div>
+        <span style={{fontSize:"11px",fontWeight:600,padding:"2px 9px",borderRadius:"999px",background:status.bg,color:status.c,whiteSpace:"nowrap"}}>{status.t}</span>
+      </div>
+      <div style={{display:"flex",gap:"16px",flexWrap:"wrap",alignItems:"flex-end",margin:"14px 0 12px"}}>
+        <div><label style={lbl} htmlFor="afwUntil">Open until</label><input id="afwUntil" type="date" value={until} min={manilaTodayISO()} onChange={function(e){setUntil(e.target.value);}} style={inp}/></div>
+        <div><label style={lbl}>Audits from <span style={{fontWeight:400}}>(ticket date, optional)</span></label>
+          <div style={{display:"flex",gap:"6px",alignItems:"center"}}>
+            <input type="date" value={from} onChange={function(e){setFrom(e.target.value);}} style={inp} aria-label="Audits from"/>
+            <span style={{fontSize:"12px",color:"var(--color-text-secondary)"}}>to</span>
+            <input type="date" value={to} onChange={function(e){setTo(e.target.value);}} style={inp} aria-label="Audits to"/>
+            {(from||to)&&<button onClick={function(){setFrom("");setTo("");}} style={{...ghost,fontSize:"12px",padding:"6px 10px"}}>All dates</button>}
+          </div>
+        </div>
+      </div>
+      <p style={{margin:"0 0 12px",fontSize:"12px",color:"var(--color-text-secondary)"}}>
+        Covers {from||to ? ("locked audits from "+(from?fmtDay(from):"the start")+" to "+(to?fmtDay(to):"now")) : "all past autofails"} · default length 4 weeks.
+      </p>
+      <div style={{display:"flex",gap:"8px",flexWrap:"wrap"}}>
+        <button onClick={function(){save(true);}} disabled={busy||!until} style={{...btnInfo,opacity:(busy||!until)?0.5:1}}>{w.active?"Update window":"Open window"}</button>
+        {w.active&&<button onClick={function(){save(false);}} disabled={busy} style={{...ghost,color:"var(--color-text-danger)"}}>Close now</button>}
+      </div>
+      {(w.history||[]).length>0&&(
+        <details style={{marginTop:"12px"}}>
+          <summary style={{cursor:"pointer",fontSize:"12px",color:"var(--color-text-secondary)"}}>History ({w.history.length})</summary>
+          <div style={{marginTop:"6px",fontSize:"12px",lineHeight:"1.7"}}>
+            {w.history.slice().reverse().map(function(h,i){ return <div key={i}>{new Date(h.at).toLocaleString()} — <strong>{h.by}</strong> {h.action==="close"?"closed the window":(h.action==="open"?"opened":"updated")+" it until "+fmtDay(h.until)+((h.from||h.to)?(" (audits "+(h.from?fmtDay(h.from):"start")+" – "+(h.to?fmtDay(h.to):"now")+")"):"")}</div>; })}
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}
+
 function allTrue(arr){ var o={}; arr.forEach(function(k){ o[k]=true; }); return o; }
 
 // Reusable checkbox multi-select dropdown for the Fetch tab. Driven by a {value:true} map;
@@ -2658,7 +2736,7 @@ function App() {
   const [dashTo,setDashTo]=useState("");
   const [reviewedTickets,setReviewedTickets]=useState({});
   const [savingReviewed,setSavingReviewed]=useState(false);
-  const [reviewFilters,setReviewFilters]=useState({week:"",agent:"",auditor:"",disputedOnly:false,reviewStatus:"all"});
+  const [reviewFilters,setReviewFilters]=useState({week:"",agent:"",auditor:"",disputedOnly:false,autofailOnly:false,reviewStatus:"all"});
   const [reviewSelected,setReviewSelected]=useState(null);
   const [disputeState,setDisputeState]=useState({});
   const [savingDispute,setSavingDispute]=useState(false);
@@ -2748,6 +2826,7 @@ function App() {
   const [afRejectReason,setAfRejectReason]=useState("");
   const [savingAfDispute,setSavingAfDispute]=useState(false);
   const [calibPending,setCalibPending]=useState(0);
+  const [afWindow,setAfWindow]=useState(null);   // v3.7.0 autofail dispute window (from /api/me)
   const [manualLoaded,setManualLoaded]=useState(null);       // {ticket, warnings[], alreadyAudited, noTranscript}
   const [manualLoading,setManualLoading]=useState(false);
   const [manualAgentOverride,setManualAgentOverride]=useState(""); // only when Gorgias has no assignee
@@ -2908,7 +2987,7 @@ function App() {
         setSsoLoading(false);
         return;
       }
-      if(user && user.active!==false) { await loadUsersFromDb(); setMigrationMode(!!(me&&me.migrationMode)); }
+      if(user && user.active!==false) { await loadUsersFromDb(); setMigrationMode(!!(me&&me.migrationMode)); setAfWindow((me&&me.autofailWindow)||null); }
 
       // Not in DB at all
       if(!user){
@@ -4571,18 +4650,28 @@ Rules:
   // so it counts as an open dispute everywhere (Home card, Review Audits badge, Disputed filter) for free.
   // calcDisputedScore only reads matrix category ids, so this key never affects a category score.
   // Approving removes the autofail and restores the real score; rejecting keeps it, with the reason logged.
+  // v3.7.0: is this (locked) audit covered by an open autofail dispute window?
+  function afWindowCovers(t){
+    var w = afWindow; if(!w || !w.active || !t) return false;
+    if(w.until && manilaTodayISO() > w.until) return false;          // closes itself even without a reload
+    var d = String(t.createdDate||t.savedAt||"").slice(0,10);
+    if(w.from && d && d < w.from) return false;
+    if(w.to && d && d > w.to) return false;
+    return true;
+  }
   async function submitAutofailDispute(reason){
     var t = reviewSelected;
     if(!t || !t.autofail) return;
     if(!reason || !reason.trim()){ addToast("Explain why the autofail should be removed","error"); return; }
-    if(isTicketLocked(t)){ addToast("This ticket is locked ("+ticketLockDateLabel(t)+") — disputes can no longer be filed","error"); return; }
+    if(isTicketLocked(t) && !afWindowCovers(t)){ addToast("This ticket is locked ("+ticketLockDateLabel(t)+") — disputes can no longer be filed","error"); return; }
     if(t.disputes && t.disputes[AUTOFAIL_DISPUTE_KEY]){ addToast("An autofail dispute already exists for this audit","error"); return; }
     setSavingAfDispute(true);
     try {
       var updated = Object.assign({}, t.disputes||{});
       updated[AUTOFAIL_DISPUTE_KEY] = { type:"autofail", finalScore:"REMOVE AUTOFAIL", condition:(t.autofails||[]).join("; "),
         justification:reason.trim(), disputer:currentUser.name, disputedAt:new Date().toISOString(),
-        status:"pending", rejectedReason:"", decidedBy:"", decidedAt:"" };
+        status:"pending", rejectedReason:"", decidedBy:"", decidedAt:"",
+        viaWindow: isTicketLocked(t) };   // v3.7.0: filed on a locked audit through the dispute window
       await dbPatchTicketRetry(t.rowId, {disputes:updated, hasDisputes:true});
       await verifyDisputesSaved(t.rowId, Object.keys(updated).length);
       var nt = Object.assign({}, t, {disputes:updated, hasDisputes:true});
@@ -4597,13 +4686,13 @@ Rules:
     var d = t && t.disputes && t.disputes[AUTOFAIL_DISPUTE_KEY];
     if(!t || !d || d.status!=="pending" || !isEditor) return;
     if(!approve && !(rejectReason||"").trim()){ addToast("Give a reason for rejecting","error"); return; }
-    if(isTicketLocked(t)){ addToast("This ticket is locked ("+ticketLockDateLabel(t)+") — a Full-access user must unlock it first","error"); return; }
+    if(isTicketLocked(t) && !afWindowCovers(t)){ addToast("This ticket is locked ("+ticketLockDateLabel(t)+") — a Full-access user must unlock it first","error"); return; }
     setSavingAfDispute(true);
     try {
       var now = new Date().toISOString();
       var updated = Object.assign({}, t.disputes);
       updated[AUTOFAIL_DISPUTE_KEY] = Object.assign({}, d, { status: approve?"approved":"rejected", decidedBy:currentUser.name, decidedAt:now,
-        rejectedReason: approve ? "" : rejectReason.trim() });
+        rejectedReason: approve ? "" : rejectReason.trim(), decidedViaWindow: isTicketLocked(t) });
       var patch = {disputes:updated, hasDisputes:true}, local = {disputes:updated, hasDisputes:true};
       if(approve){
         // same restore as "Remove autofail": the real score comes back from the category levels
@@ -6966,6 +7055,18 @@ Rules:
       <h1 className="wm-title">{pageTitle}</h1>
       {UI_LEDES[view]&&<p className="wm-lede">{UI_LEDES[view]}</p>}
 
+      {/* v3.7.0: autofail dispute window notice (Home) */}
+      {view==="dashboard"&&afWindowCovers({createdDate:""})&&(function(){
+        var pend = isEditor ? (tickets||[]).filter(function(t){ var d=t.disputes&&t.disputes[AUTOFAIL_DISPUTE_KEY]; return d&&d.status==="pending"; }).length : 0;
+        var range = (afWindow.from||afWindow.to) ? (" from "+(afWindow.from?fmtDay(afWindow.from):"the start")+" to "+(afWindow.to?fmtDay(afWindow.to):"now")) : "";
+        return <div style={{background:"var(--color-background-info)",color:"var(--color-text-info)",border:"1px solid var(--color-border-info)",borderRadius:"var(--border-radius-md)",padding:"10px 14px",fontSize:"13px",marginBottom:"16px",display:"flex",justifyContent:"space-between",alignItems:"center",gap:"12px",flexWrap:"wrap"}}>
+          <span>{isViewOnly
+            ? <span><strong>Autofail disputes are open until {fmtDay(afWindow.until)}</strong> for past audits{range}, including locked ones. Open the audit in Review Audits and use “Dispute autofail”.</span>
+            : <span><strong>Autofail dispute window open until {fmtDay(afWindow.until)}</strong>{range?(" (audits"+range+")"):""}. {pend} autofail dispute{pend===1?"":"s"} waiting.</span>}</span>
+          <button onClick={function(){ navGo("review"); setReviewFilters(function(f){ return Object.assign({},f,{autofailOnly:true}); }); }} style={{...ghost,fontSize:"12px",padding:"6px 12px"}}>Show autofailed audits</button>
+        </div>;
+      })()}
+
 
       {/* ── BATCH QA ── */}
       {view==="batch" && (
@@ -7189,6 +7290,10 @@ Rules:
                     <input type="checkbox" checked={reviewFilters.disputedOnly} onChange={function(e){setReviewFilters(function(f){return Object.assign({},f,{disputedOnly:e.target.checked});});}}/>
                     Disputed only
                   </label>
+                  <label style={{display:"flex",alignItems:"center",gap:"6px",fontSize:"13px",cursor:"pointer",paddingBottom:"2px"}}>
+                    <input type="checkbox" checked={reviewFilters.autofailOnly} onChange={function(e){setReviewFilters(function(f){return Object.assign({},f,{autofailOnly:e.target.checked});});}}/>
+                    Autofailed only
+                  </label>
                   <div style={{display:"flex",flexDirection:"column",gap:"4px"}}>
                     <span style={sectionLabel}>Review status</span>
                     <select style={{fontSize:"13px",padding:"5px 8px"}} value={reviewFilters.reviewStatus} onChange={function(e){setReviewFilters(function(f){return Object.assign({},f,{reviewStatus:e.target.value});});}}>
@@ -7198,7 +7303,7 @@ Rules:
                       {isEditor&&<option value="pending_disputes">Pending agent disputes</option>}
                     </select>
                   </div>
-                  <button onClick={function(){setReviewFilters({week:"",agent:"",auditor:"",disputedOnly:false,reviewStatus:"all"});}} style={ghost}>Reset</button>
+                  <button onClick={function(){setReviewFilters({week:"",agent:"",auditor:"",disputedOnly:false,autofailOnly:false,reviewStatus:"all"});}} style={ghost}>Reset</button>
                 </div>
               </div>
 
@@ -7209,6 +7314,7 @@ Rules:
                   if(reviewFilters.agent&&t.agentName!==reviewFilters.agent)return false;
                   if(reviewFilters.auditor&&t.reviewer!==reviewFilters.auditor)return false;
                   if(reviewFilters.disputedOnly&&!t.hasDisputes)return false;
+                  if(reviewFilters.autofailOnly&&!t.autofail)return false;   // v3.7.0
                   var isReviewed=reviewedTickets[t.id||t.ticketId]||t.reviewed;
                   if(reviewFilters.reviewStatus==="reviewed"&&!isReviewed)return false;
                   if(reviewFilters.reviewStatus==="pending"&&isReviewed)return false;
@@ -7433,7 +7539,8 @@ Rules:
               {/* ── Autofail + autofail dispute (v3.6.0) ── */}
               {(reviewSelected.autofail || (reviewSelected.disputes&&reviewSelected.disputes[AUTOFAIL_DISPUTE_KEY])) && (function(){
                 var d = reviewSelected.disputes && reviewSelected.disputes[AUTOFAIL_DISPUTE_KEY];
-                var locked = isTicketLocked(reviewSelected);
+                var windowCovers = isTicketLocked(reviewSelected) && afWindowCovers(reviewSelected);
+                var locked = isTicketLocked(reviewSelected) && !windowCovers;   // v3.7.0: the dispute window reopens autofail disputes only
                 var canFile = isViewOnly && reviewSelected.autofail && !d && !locked;
                 var st = d ? d.status : null;
                 var badge = st==="pending" ? {t:"Dispute pending",bg:T.amber.bg,c:T.amber.text} : st==="approved" ? {t:"Dispute approved",bg:T.green.bg,c:T.green.text} : st==="rejected" ? {t:"Dispute rejected",bg:T.red.bg,c:T.red.text} : null;
@@ -7448,6 +7555,11 @@ Rules:
                       </div>
                       {badge&&<span style={{fontSize:"11px",fontWeight:600,padding:"2px 9px",borderRadius:"999px",background:badge.bg,color:badge.c,whiteSpace:"nowrap"}}>{badge.t}</span>}
                     </div>
+                    {windowCovers&&(reviewSelected.autofail||st==="pending")&&(
+                      <div style={{marginTop:"10px",fontSize:"12px",color:"var(--color-text-info)"}}>
+                        This audit is locked, but the autofail dispute window is open until {fmtDay(afWindow.until)}, so its autofail can be {isViewOnly?"disputed":"decided"}.
+                      </div>
+                    )}
                     {d&&(
                       <div style={{marginTop:"12px",padding:"10px 12px",borderRadius:"var(--border-radius-md)",background:"var(--color-background-secondary)",fontSize:"13px",lineHeight:"1.55"}}>
                         <div><strong>{d.disputer}</strong> <span style={{color:"var(--color-text-secondary)"}}>· {d.disputedAt?new Date(d.disputedAt).toLocaleString():""}</span></div>
@@ -7486,7 +7598,7 @@ Rules:
               <div style={card}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"12px"}}>
                   <p style={{margin:0,fontWeight:500,fontSize:"14px"}}>
-                    {isEditor?"Scores — click any category to dispute":isViewOnly&&reviewSelected.reviewed?"Scores — click to dispute your ticket":"Scores"}
+                    {isTicketLocked(reviewSelected)?"Scores":isEditor?"Scores — click any category to dispute":isViewOnly&&reviewSelected.reviewed?"Scores — click to dispute your ticket":"Scores"}
                   </p>
                   {isEditor&&<span style={{fontSize:"12px",color:"var(--color-text-secondary)"}}>Disputing as <strong>{currentUser.name}</strong></span>}
                   {isViewOnly&&reviewSelected.reviewed&&<span style={{fontSize:"12px",color:"var(--color-text-secondary)"}}>Disputes require auditor approval</span>}
@@ -7530,7 +7642,7 @@ Rules:
                             </div>
                           </React.Fragment>}
                           {/* Dispute button — Editor: full dispute; View: submit for approval */}
-                          {!isEditing&&isEditor&&<button onClick={function(){setDisputeState(function(s){
+                          {!isEditing&&isEditor&&!isTicketLocked(reviewSelected)&&<button onClick={function(){setDisputeState(function(s){ /* v3.7.0: hidden on locked audits (saving was already refused) */
                                   var prev=s[c.id]||{};
                                   var defJust=existingDispute?existingDispute.justification:"";
                                   return Object.assign({},s,{[c.id]:Object.assign({},prev,{editing:true,newScore:prev.newScore||currentFinal,justification:prev.justification||defJust})});
@@ -7538,7 +7650,7 @@ Rules:
                             {isDisputed||hasChange?"Edit":"Dispute"}
                           </button>}
                           {/* Agent View: Dispute button only if ticket is reviewed AND no existing dispute */}
-                          {!isEditing&&isViewOnly&&!existingDispute&&!ds.editing&&(
+                          {!isEditing&&isViewOnly&&!existingDispute&&!ds.editing&&!isTicketLocked(reviewSelected)&&(
                             reviewSelected.reviewed
                               ? <button onClick={function(){setDisputeState(function(s){
                                     return Object.assign({},s,{[c.id]:{editing:true,newScore:currentFinal,justification:""}});
@@ -9859,6 +9971,7 @@ Rules:
               {/* ── ADMIN TOOLS TAB (Full access only) ── */}
               {settingsTab==="admin"&&isFullAccess&&(
                 <div>
+                  <AutofailWindowPanel addToast={addToast} value={afWindow} onChange={setAfWindow}/>
                   {/* Database (Postgres) — import / verify / cutover. Full access only */}
                   {isFullAccess&&(
                     <div style={{border:"1px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
