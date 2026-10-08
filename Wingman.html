@@ -2,10 +2,23 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.6.0
-  Date:     2026-10-05
+  Version:  3.6.1
+  Date:     2026-10-13
 
   Changelog:
+  v3.6.1 (2026-10-13) -- FIX: FALSE AUTOFAILS + REVIEW CRASH (React error #31, e.g. ticket 464539800)
+    - Root cause: the scoring prompt's schema was just "autofails":[], and the AI sometimes returned EVERY condition
+      with a verdict ([{fail:false, description:"..."}]). Any non-empty list counted as an autofail, so tickets where
+      the AI said NO autofail applied were marked autofailed (0% since v3.5.0), and Review crashed rendering the object.
+    - Prompt now says: list only the conditions that apply, as their exact text; [] if none.
+    - normalizeAutofails() on every scoring path (AI Audit, re-audit, Manual Audit, Delete & Replace, re-score tool):
+      keeps only entries that apply (fail/failed/triggered true, or plain strings), stored as text. Also applied on
+      load, and Review renders autofails via autofailText(), so a malformed entry can never crash the page again.
+    - One-time server repair: audits whose autofails contain objects get cleaned. If no condition applied (and the
+      autofail wasn't manual) the autofail is cleared and AI/final scores + pass flags restored from the category
+      levels (approved disputes included); otherwise the conditions are stored as text. Ticket IDs are recorded in
+      app_state "migration_autofail_objects".
+
   v3.6.0 (2026-10-05) -- MAIN WINDOW RESTYLE + AUTOFAIL DISPUTES + CALIBRATION BADGE
     - RESTYLE (matches the sidebar; approved prototype wingman_style_prototype.html). Shared tokens: 1px borders,
       6px controls / 10px cards, sentence-case labels (no ALL CAPS / letter-spacing), weights 400/500/600 only,
@@ -962,7 +975,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.6.0";
+const APP_VERSION = "v3.6.1";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -1264,7 +1277,7 @@ function parseTicketRow(r) {
   let aiScores = {}, disputes = {}, justifications = {}, autofails = [];
   aiScores  = safeParse(r.scoresJSON       || r["Scores JSON"]       || "{}", {});
   disputes  = safeParse(r.disputesJSON     || r["Disputes JSON"]     || "",   {});
-  autofails = safeParse(r.autofailsJSON    || r["Autofails JSON"]    || "",   []);
+  autofails = safeParse(r.autofailsJSON    || r["Autofails JSON"]    || "",   []); autofails = normalizeAutofails(autofails);   /* v3.6.1: never render raw objects */
   var rawJust = safeParse(r.justificationsJSON || r["Justifications JSON"] || "{}", {});
   // Handle both compressed format {r,i} and full format {reason,improve}
   Object.entries(rawJust).forEach(function(e){
@@ -2524,6 +2537,30 @@ function InsightsPanel({filtered, matrix, matrixVersion, dashFrom, dashTo, addTo
 // v3.6.0: reserved dispute key for "remove this autofail" disputes (not a matrix category)
 var AUTOFAIL_DISPUTE_KEY = "__autofail";
 function disputeLabel(cid, matrix){ if(cid===AUTOFAIL_DISPUTE_KEY) return "Autofail (whole audit)"; var c=(matrix||[]).find(function(m){return m.id===cid;}); return c?c.label:cid; }
+// v3.6.1: the AI sometimes returns autofails as objects listing EVERY condition with a verdict, e.g.
+// [{fail:false, description:"Rude to customer"}]. Only conditions that actually apply may count, and they're stored
+// as plain text. (Before this, any non-empty list counted as an autofail, including fail:false entries.)
+function autofailText(a){
+  if (a == null) return "";
+  if (typeof a === "string") return a.trim();
+  if (typeof a === "object") return String(a.description || a.condition || a.name || a.reason || a.label || a.text || "").trim() || JSON.stringify(a);
+  return String(a);
+}
+function autofailApplies(a){
+  if (a == null) return false;
+  if (typeof a === "string") { var t=a.trim().toLowerCase(); return !!t && ["none","n/a","na","no","false","[]"].indexOf(t)===-1; }
+  if (typeof a === "object") {
+    var keys=["fail","failed","triggered","applies","autofail","isAutofail","value","result"];
+    for (var i=0;i<keys.length;i++){ if (a[keys[i]]!==undefined) { var v=a[keys[i]]; return v===true || /^(true|yes|fail|failed|y)$/i.test(String(v)); } }
+    return true;   // object with no verdict field: treat it as a listed (triggered) condition
+  }
+  return !!a;
+}
+function normalizeAutofails(arr){
+  if (!Array.isArray(arr)) return [];
+  var out=[]; arr.forEach(function(a){ if(autofailApplies(a)){ var t=autofailText(a); if(t && out.indexOf(t)===-1) out.push(t); } });
+  return out;
+}
 function allTrue(arr){ var o={}; arr.forEach(function(k){ o[k]=true; }); return o; }
 
 // Reusable checkbox multi-select dropdown for the Fetch tab. Driven by a {value:true} map;
@@ -3170,6 +3207,7 @@ function App() {
     if(!jsonMatch) throw new Error("No JSON in Claude response");
     var parsed = JSON.parse(jsonMatch[0]);
     var sc = calcScore(parsed.scores||{}, matrix);
+    parsed.autofails = normalizeAutofails(parsed.autofails);   // v3.6.1
     var hasAF = (parsed.autofails||[]).length > 0;
 
     var newResult = {
@@ -3285,6 +3323,7 @@ function App() {
         if(!jsonMatch) throw new Error("No JSON in Claude response");
         var parsed = JSON.parse(jsonMatch[0]);
         var sc = calcScore(parsed.scores||{}, matrix);
+        parsed.autofails = normalizeAutofails(parsed.autofails);   // v3.6.1
         var hasAF = (parsed.autofails||[]).length > 0;
         // Re-audit re-scores the SAME ticket, so its week must not change. Prefer the stored
         // week (preserves any manual correction) and only re-derive as a fallback.
@@ -3523,7 +3562,8 @@ function App() {
       +"- Score based on what IS in the transcript\n"
 +(scoringContext&&scoringContext.trim()?"- WORKFLOW & CONTEXT NOTES:\n"+scoringContext.trim()+"\n":"")
       +"CATEGORIES:\n"+rubric+"\n\n"
-      +"AUTOFAILS:\n"+afLines+"\n\n"
+      +"AUTOFAILS:\n"+afLines+"\n"
+      +"In \"autofails\" list ONLY the conditions that apply, each as its exact text (plain strings). If none apply return []. Never list conditions that do not apply.\n\n"
       +"TICKET ID: "+ticket.ticketId+"\n"
       +"AGENT: "+ticket.agentName+"\n"
       +"SUBJECT: "+ticket.contactReason+"\n\n"
@@ -3536,7 +3576,7 @@ function App() {
       +'Respond ONLY with JSON: {"meta":{"contactReason":"...","product":"...","ticketResolution":"...","returnOrRefund":"..."},'
       +'"scores":{'+scoresSchema+'},'
       +'"justifications":{'+justSchema+'},'
-      +'"autofails":[],'
+      +'"autofails":["<exact text of each AUTOFAIL condition that applies; [] if none>"],'
       +'"comments":"+ [key strength observation]\\n- [key improvement observation]"}';
   }
 
@@ -3583,6 +3623,7 @@ function App() {
         if(!jsonMatch)throw new Error("No JSON in response");
         var parsed=JSON.parse(jsonMatch[0]);
         var sc=calcScore(parsed.scores||{},matrix);
+        parsed.autofails = normalizeAutofails(parsed.autofails);   // v3.6.1
         var hasAF=(parsed.autofails||[]).length>0;
         newResult={
           id:Date.now()+i,week:ticketWeekLabel(ticket.createdDate)||week,auditWeek:week,
@@ -4919,7 +4960,8 @@ Rules:
         var parsed = JSON.parse(jm[0]);
         var newScores = parsed.scores||{};
         var sc = calcScore(newScores, matrix);
-        var aiAutofails = parsed.autofails||[];
+        parsed.autofails = normalizeAutofails(parsed.autofails);   // v3.6.1
+        var aiAutofails = parsed.autofails;
         var autofail = t.autofailManual ? true : aiAutofails.length>0;
         var newPct = autofail ? 0 : (sc?sc.pct:0);      // v3.5.0: autofail = 0%
         var disputedRes = calcDisputedScore(Object.assign({}, t, {aiScores:newScores, autofail:autofail}), matrix);
@@ -5943,6 +5985,7 @@ Rules:
       if(!jsonMatch) throw new Error("AI scoring failed — no JSON in response");
       var parsed = JSON.parse(jsonMatch[0]);
       var sc = calcScore(parsed.scores||{}, matrix);
+      parsed.autofails = normalizeAutofails(parsed.autofails);   // v3.6.1
       var hasAF = (parsed.autofails||[]).length>0;
       // Same shape as an AI Audit result (see runBatchQA) — only auditType differs
       var result = {
@@ -7091,7 +7134,7 @@ Rules:
                 {selectedResult.autofails&&selectedResult.autofails.length>0&&(
                   <div style={{marginTop:"10px",padding:"10px 12px",background:T.red.bg,borderRadius:"var(--border-radius-md)",border:"1px solid "+T.red.border}}>
                     <p style={{margin:"0 0 4px",fontSize:"11px",fontWeight:600,color:T.red.text}}>Autofail</p>
-                    {selectedResult.autofails.map(function(a,i){return <p key={i} style={{margin:"2px 0",fontSize:"12px",color:T.red.text}}>{a}</p>;})}
+                    {normalizeAutofails(selectedResult.autofails).map(function(a,i){return <p key={i} style={{margin:"2px 0",fontSize:"12px",color:T.red.text}}>{a}</p>;})}
                   </div>
                 )}
                 {selectedResult.comments&&(
@@ -7354,7 +7397,7 @@ Rules:
                 {reviewSelected.autofail&&reviewSelected.autofails&&reviewSelected.autofails.length>0&&(
                   <div style={{padding:"10px 14px",background:"var(--color-background-danger)",borderRadius:"var(--border-radius-md)",border:"1px solid var(--color-border-danger)",marginBottom:"12px"}}>
                     <div style={{fontSize:"11px",fontWeight:600,color:"var(--color-text-danger)",marginBottom:"4px"}}>⚠ Autofail</div>
-                    {reviewSelected.autofails.map(function(af,i){return <div key={i} style={{fontSize:"12px",color:"var(--color-text-danger)",lineHeight:"1.5"}}>{af}</div>;})}
+                    {(reviewSelected.autofails||[]).map(function(af,i){return <div key={i} style={{fontSize:"12px",color:"var(--color-text-danger)",lineHeight:"1.5"}}>{autofailText(af)}</div>;})}
                   </div>
                 )}
 

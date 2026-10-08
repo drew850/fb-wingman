@@ -1,4 +1,4 @@
-# Wingman server — v3.6.0
+# Wingman server — v3.6.1
 # Storage: Postgres (DATABASE_URL). Notion is used ONLY by the one-time import + verify
 # jobs under /api/admin/*, server-side, and is never proxied for the browser.
 import os, json, re, urllib.request, urllib.error, secrets, hashlib, time, threading, queue, base64, traceback, uuid
@@ -16,7 +16,7 @@ except Exception as _imp_err:  # server still boots and reports the problem on /
     psycopg = None
     _PSYCOPG_IMPORT_ERROR = str(_imp_err)
 
-SERVER_VERSION      = "3.6.0"
+SERVER_VERSION      = "3.6.1"
 HTML_FILE           = "Wingman.html"
 PORT                = int(os.environ.get("PORT", 3747))
 DIR                 = os.path.dirname(os.path.abspath(__file__))
@@ -291,6 +291,96 @@ def migrate_autofail_zero():
     state_set("migration_autofail_zero", {"done": True, "at": now_iso(), "rows": n})
     print(f"[Migration] autofail = 0%: {n} audit(s) updated")
     return n
+
+# ── v3.6.1 one-time repair: autofails stored as {fail:false,...} objects ──────────
+# The AI sometimes returned every autofail condition with a verdict. Any non-empty list counted as an autofail, so
+# tickets where the AI said NO autofail applied were marked autofailed (0% since v3.5.0). This keeps only conditions
+# that apply, as text; when none apply it clears the autofail and restores the real score. Manual autofails untouched.
+def _af_text(a):
+    if a is None: return ""
+    if isinstance(a, str): return a.strip()
+    if isinstance(a, dict):
+        for k in ("description", "condition", "name", "reason", "label", "text"):
+            if a.get(k): return str(a[k]).strip()
+        return json.dumps(a)
+    return str(a)
+
+def _af_applies(a):
+    if a is None: return False
+    if isinstance(a, str):
+        t = a.strip().lower(); return bool(t) and t not in ("none", "n/a", "na", "no", "false", "[]")
+    if isinstance(a, dict):
+        for k in ("fail", "failed", "triggered", "applies", "autofail", "isAutofail", "value", "result"):
+            if k in a:
+                v = a[k]; return v is True or bool(re.fullmatch(r"(true|yes|fail|failed|y)", str(v), re.I))
+        return True
+    return bool(a)
+
+def normalize_autofails(arr):
+    out = []
+    for a in (arr if isinstance(arr, list) else []):
+        if _af_applies(a):
+            t = _af_text(a)
+            if t and t not in out: out.append(t)
+    return out
+
+def _score_val(v):
+    if not v or v == "NA": return None
+    m = re.search(r"\(([\d.]+)\)", str(v)); return float(m.group(1)) if m else None
+
+def _calc_pct(scores, matrix):
+    pts = mx = 0.0
+    for c in matrix:
+        sv = _score_val((scores or {}).get(c.get("id")))
+        if sv is not None: pts += sv; mx += float(c.get("max") or 0)
+    return None if mx == 0 else round(pts / mx * 100)
+
+def _norm_dispute(val, cat):
+    """Twin of normalizeDisputeScore(): bare labels ('YES','Pass','Miss') -> 'LEVEL (points)'."""
+    if not val or re.search(r"\([\d.]+\)", str(val)): return val
+    up = str(val).upper()
+    for l in cat.get("levels") or []:
+        lv = str(l.get("level", "")).upper()
+        if lv == up or (up == "PASS" and lv.startswith("YES")) or (up == "MISS" and lv.startswith("NO")):
+            if l.get("points") is not None: return f"{l['level']} ({l['points']})"
+    return val
+
+def _disputed_pct(scores, disputes, matrix):
+    merged = {}
+    for c in matrix:
+        d = (disputes or {}).get(c["id"])
+        use = isinstance(d, dict) and (d.get("status") == "approved" or not d.get("status"))
+        merged[c["id"]] = _norm_dispute(d.get("finalScore"), c) if use else (scores or {}).get(c["id"], "")
+    return _calc_pct(merged, matrix)
+
+def repair_autofail_objects():
+    if POOL is None or (state_get("migration_autofail_objects") or {}).get("done"):
+        return 0
+    m = db_one("SELECT value FROM config WHERE key='matrix'")
+    matrix = (m or {}).get("value") if m else None
+    if not isinstance(matrix, list) or not matrix:
+        print("[Migration] autofail objects: no saved matrix, skipped (will retry next start)"); return 0
+    rows = db_all("""SELECT id, ticket_id, autofail, autofail_manual, autofails, scores, disputes FROM tickets
+                     WHERE jsonb_typeof(autofails) = 'array' AND jsonb_array_length(autofails) > 0
+                       AND EXISTS (SELECT 1 FROM jsonb_array_elements(autofails) e WHERE jsonb_typeof(e) <> 'string')""")
+    cleared, cleaned = [], []
+    with POOL.connection() as conn:
+        for r in rows:
+            norm = normalize_autofails(r["autofails"])
+            if r["autofail_manual"] or norm:
+                # keep the autofail (manual, or a condition really applied) but store the conditions as text
+                conn.execute("UPDATE tickets SET autofails=%s, updated_at=now(), app_updated_at=now() WHERE id=%s", (Jsonb(norm if norm else [_af_text(a) for a in r["autofails"]]), r["id"]))
+                cleaned.append(r["ticket_id"]); continue
+            ai = _calc_pct(r["scores"], matrix) or 0
+            fin = _disputed_pct(r["scores"], r["disputes"], matrix)
+            fin = ai if fin is None else fin
+            conn.execute("""UPDATE tickets SET autofail=false, autofails='[]'::jsonb, ai_score=%s, final_score=%s,
+                              ai_passed=%s, final_passed=%s, updated_at=now(), app_updated_at=now() WHERE id=%s""",
+                         (ai, fin, ai >= 85, fin >= 85, r["id"]))
+            cleared.append(r["ticket_id"])
+    state_set("migration_autofail_objects", {"done": True, "at": now_iso(), "cleared": cleared, "cleanedOnly": cleaned})
+    print(f"[Migration] autofail objects: {len(cleared)} false autofail(s) cleared + scores restored, {len(cleaned)} cleaned to text")
+    return len(cleared)
 
 def db_all(sql, params=None):
     with POOL.connection() as conn:
@@ -2358,6 +2448,7 @@ if __name__ == "__main__":
         print(f"Cutover: {cutover_state()}")
         print(f"Snapshots requeued: {requeue_pending_snapshots()}")
         migrate_autofail_zero()
+        repair_autofail_objects()
     threading.Thread(target=snapshot_worker, daemon=True).start()
     threading.Thread(target=get_ctf_field_options, daemon=True).start()   # warm the live CTF option cache
     Server(("0.0.0.0", PORT), Handler).serve_forever()
