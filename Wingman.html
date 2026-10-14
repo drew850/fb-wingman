@@ -2,10 +2,28 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.7.0
-  Date:     2026-10-08
+  Version:  3.8.0
+  Date:     2026-10-14
 
   Changelog:
+  v3.8.0 (2026-10-14) -- NO TRANSCRIPT CAPS + ONE-TIME RE-SCORE OF CUT-OFF AUDITS
+    - FIX: the AI scoring prompt cut every transcript to 8,000 characters (buildEvalPrompt and the CTF-only prompt), and
+      stripHTML() clipped each HTML email to 2,000 characters when tickets were fetched. Long email threads were scored
+      without their latest replies (e.g. #466674895: an 8,937-char transcript lost Joanna's 22:31 correction and the AI
+      reported her 22:24 reply as "cut off mid-sentence"). Both caps removed.
+    - transcriptForAI(): before scoring, each message drops its QUOTED EMAIL HISTORY ("On Sun, Oct 11 2026 ... wrote:",
+      Outlook "From: ... Sent:", "-----Original Message-----"), marked "[earlier quoted emails removed]"; the prompt tells
+      the AI this is not a cut-off reply. Runs at prompt time, so it also applies to transcripts saved earlier; the
+      saved transcript shown to reviewers is unchanged. Emergency guard only above 500,000 chars (keeps start + end,
+      marked) so a freak ticket can't break the AI call — Haiku 4.5 reads ~600k+ chars.
+    - stripHTML(): decodes all numeric HTML entities (&#x27; &#8217; ...) and common named ones (&rsquo; &ndash; ...),
+      not just &#39; / &quot;, so the AI no longer reads "I&#x27;ve".
+    - ONE-TIME FIX (Admin Tools): "One-time fix: audits scored on a cut-off transcript" shows how many audits are affected
+      (saved transcript over 8,000 chars, or a message clipped at 2,000) and opens the re-score tool in the new
+      "Cut-off transcripts (one-time fix)" mode: all dates; each conversation is re-fetched from Gorgias, saved in full,
+      then re-scored (same preserve rules: disputes, manual autofails, auditor-edited notes). Every audit in the preview is
+      pre-selected; each is logged with reason "transcript-cutoff" and drops out of scope, so the fix runs once.
+
   v3.7.0 (2026-10-08) -- AUTOFAIL DISPUTE WINDOW
     - Admin Tools > "Autofail dispute window" (Full only): opens autofail disputes on audits that are already locked,
       until an end date (default 4 weeks; closes itself, Manila date), optionally limited to a ticket-date range
@@ -988,7 +1006,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.7.0";
+const APP_VERSION = "v3.8.0";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -2639,6 +2657,43 @@ function AutofailWindowPanel({addToast, value, onChange}){
   );
 }
 
+// ── TRANSCRIPT FOR AI (v3.8.0) ──────────────────────────────────────────────
+// v3.7 and earlier cut every transcript to 8,000 characters before scoring, so long email threads lost their
+// latest messages (e.g. #466674895 was scored as if the agent's reply stopped mid-sentence). There is no cap now.
+// Each message is also cleaned of QUOTED EMAIL HISTORY ("On Sun, Oct 11 2026 ... wrote:" and everything after,
+// Outlook "From: ... Sent: ..." blocks, "-----Original Message-----"), which is most of the length of a long thread
+// and made the AI read old text as new. Runs at prompt time, so it also applies to transcripts saved earlier.
+// The stored transcript (what reviewers see) is unchanged.
+var TRANSCRIPT_AI_SAFETY_CHARS = 500000;   // far above any real ticket; only stops a freak ticket from breaking the AI call
+var QUOTE_MARKERS = [
+  /\bOn\s(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\.?,?\s[^|]{4,200}?\bwrote:/i,
+  /\bOn\s\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}[^|]{0,200}?\bwrote:/i,
+  /\bOn\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s\d{1,2},?\s\d{4}[^|]{0,200}?\bwrote:/i,
+  /-{2,}\s*Original Message\s*-{2,}/i,
+  /\bFrom:\s[^|]{3,200}?\bSent:\s/i
+];
+function stripQuotedHistory(body){
+  var cut = -1;
+  QUOTE_MARKERS.forEach(function(rx){ var m = rx.exec(body); if(m && (cut<0 || m.index<cut)) cut = m.index; });
+  if(cut<=0) return body;                                   // nothing quoted (or the whole message is a quote: keep it)
+  var kept = body.slice(0, cut).replace(/\s+$/,"");
+  return kept.length >= 2 ? kept + " [earlier quoted emails removed]" : body;
+}
+function transcriptForAI(transcript){
+  var t = String(transcript||"");
+  // buildTranscript joins messages as "[Role - Name @ time]: body | [Role - ...". Split only on real message starts.
+  var parts = t.split(/\s\|\s(?=\[(?:Agent|Customer) - )/);
+  var out = parts.map(function(p){
+    var m = p.match(/^(\[(?:Agent|Customer) - [^\]]*\]:\s?)([\s\S]*)$/);
+    return m ? m[1] + stripQuotedHistory(m[2]) : stripQuotedHistory(p);
+  }).join(" | ");
+  if(out.length > TRANSCRIPT_AI_SAFETY_CHARS){
+    var head = out.slice(0, 100000), tail = out.slice(-(TRANSCRIPT_AI_SAFETY_CHARS-100000));
+    out = head + " | [... "+(out.length-TRANSCRIPT_AI_SAFETY_CHARS).toLocaleString()+" characters omitted from the middle of an exceptionally long ticket — do not penalise the agent for this gap ...] | " + tail;
+  }
+  return out;
+}
+
 function allTrue(arr){ var o={}; arr.forEach(function(k){ o[k]=true; }); return o; }
 
 // Reusable checkbox multi-select dropdown for the Fetch tab. Driven by a {value:true} map;
@@ -3622,8 +3677,7 @@ function App() {
     var afLines=autofailList.map(function(a,i){return (i+1)+". "+a;}).join("\n");
     var scoresSchema=matrix.map(function(c,i){return '"'+c.id+'":"'+scoreOptions[i]+'"';}).join(",");
     var justSchema=matrix.map(function(c){return '"'+c.id+'":{"reason":"1-2 sentences","improve":"1 sentence or null"}';}).join(",");
-    var cleanTranscript = (ticket.transcript||"")
-      .slice(0,8000)
+    var cleanTranscript = transcriptForAI(ticket.transcript)   // v3.8.0: no 8,000-char cap; quoted email history removed
       .replace(/â€™/g,"'").replace(/â€˜/g,"'")
       .replace(/â€œ/g,'"').replace(/â€/g,'"')
       .replace(/â€"/g,"—").replace(/â€"/g,"–").replace(/â€¦/g,"...");
@@ -3631,6 +3685,7 @@ function App() {
       +"ENCODING NOTE: The transcript may contain mojibake encoding artifacts (e.g. â€™ â€œ). "
       +"Interpret these as their intended characters (smart quotes, apostrophes) and evaluate normally.\n\n"
       +"IMPORTANT CONTEXT:\n"
+      +"- Each message shows only what was newly written; quoted earlier emails were removed to save space (marked [earlier quoted emails removed]). Do NOT treat that as an incomplete or cut-off reply.\n"
       +"- Freedom Grooming uses Jamie as their AI customer service agent — Jamie IS the agent being evaluated\n"
       +"- Gorgias Bot sends only the auto-acknowledgment reply — do NOT evaluate Gorgias Bot\n"
       +"- Yuma is an escalation system — do NOT evaluate Yuma messages\n"
@@ -4822,7 +4877,7 @@ Rules:
     var levels = ctfCat.levels.map(function(l){return l.level+(l.points!==null?" ("+l.points+")":"");}).join("|");
     var defs = ctfCat.levels.map(function(l){return l.level+"="+l.definition;}).join(" | ");
     function pair(a,b){ return (a&&b&&b!=="N/A") ? a+"::"+b : (a||"not tagged"); }
-    var cleanTranscript = (ticket.transcript||"").slice(0,8000)
+    var cleanTranscript = transcriptForAI(ticket.transcript)   // v3.8.0: no 8,000-char cap; quoted email history removed
       .replace(/â€™/g,"'").replace(/â€˜/g,"'").replace(/â€œ/g,'"').replace(/â€/g,'"');
     return "You are a QA evaluator for Freedom Grooming customer support. Respond in English only.\n\n"
       +"Evaluate ONE category only: "+ctfCat.label+".\n\n"
@@ -5001,11 +5056,22 @@ Rules:
     var iso = function(x){ return x.toISOString().slice(0,10); };
     return {from: iso(mon), to: iso(d)};
   }
-  function rsEligible(){
-    var cur = matrixVersion;
+  // v3.8.0: audits scored on a cut-off transcript (v3.7 and earlier): the whole transcript was cut at 8,000 chars
+  // before scoring, and HTML emails were clipped to 2,000 chars per message when fetched (so the SAVED copy can be short too).
+  function transcriptWasCut(t){
+    var tr = String(t.transcript||""); if(tr.length > 8000) return true;
+    return tr.split(/\s\|\s(?=\[(?:Agent|Customer) - )/).some(function(p){ var b=p.replace(/^\[[^\]]*\]:\s?/,""); return b.length >= 1990; });
+  }
+  function cutoffAlreadyFixed(t){
+    var h = t.reauditHistory; if(typeof h==="string"){ try{ h=JSON.parse(h||"[]"); }catch(e){ h=[]; } }
+    return Array.isArray(h) && h.some(function(e){ return e && e.reason==="transcript-cutoff"; });
+  }
+  function rsEligible(modeOverride){
+    var cur = matrixVersion, mode = modeOverride || rsMode;
     return (tickets||[]).filter(function(t){
       if(!t.rowId || t.deleted) return false;
-      if(rsMode==="week"){ if(!rsWeek || t.week!==rsWeek) return false; }
+      if(mode==="cutoff") return transcriptWasCut(t) && !cutoffAlreadyFixed(t);   // all dates; ignores "skip already scored"
+      if(mode==="week"){ if(!rsWeek || t.week!==rsWeek) return false; }
       else {
         var sd = String(t.savedAt||"").slice(0,10);
         if(!sd || (rsFrom && sd<rsFrom) || (rsTo && sd>rsTo)) return false;
@@ -5021,14 +5087,26 @@ Rules:
     if(dirtyNow){ addToast("The Matrix page has unsaved changes. Save or discard them first so the re-score uses the saved v"+matrixVersion+".","error"); return; }
     var list = rsEligible();
     if(!list.length){ addToast("No audits match that scope","error"); return; }
-    if(!window.confirm("Preview a re-score of "+list.length+" audit"+(list.length!==1?"s":"")+" with matrix v"+matrixVersion+"?\n\nThis makes "+list.length+" AI call"+(list.length!==1?"s":"")+" (about "+Math.ceil(list.length*6/60)+" min). Nothing is saved until you apply.")) return;
+    if(!window.confirm("Preview a re-score of "+list.length+" audit"+(list.length!==1?"s":"")+" with matrix v"+matrixVersion+"?\n\n"+(rsMode==="cutoff"?"Each conversation is re-fetched from Gorgias first. ":"")+"This makes "+list.length+" AI call"+(list.length!==1?"s":"")+" (about "+Math.ceil(list.length*6/60)+" min). Nothing is saved until you apply.")) return;
     setRsRunning(true); rsStopRef.current=false; setRsPreview(null); setRsSelected({});
     var out = {items:[], skipped:[], errors:[], version:matrixVersion};
     for(var i=0;i<list.length;i++){
       if(rsStopRef.current){ setRsStatus("Stopped at "+i+" of "+list.length); break; }
       var t = list[i];
       setRsStatus("Re-scoring "+(i+1)+" of "+list.length+" — #"+t.ticketId);
-      if(!t.transcript || t.transcript.trim().length<20){ out.skipped.push({t:t, why:"No transcript stored"}); continue; }
+      var isCutoff = rsMode==="cutoff", newTranscript = null, transcriptSource = null;
+      if(isCutoff){
+        // Rebuild the full conversation from Gorgias — the saved copy may have been clipped when it was fetched
+        try {
+          var mr = await gorgiasAPI("/tickets/"+t.ticketId+"/messages", {limit:100});
+          if(mr && mr._status===429){ await new Promise(function(r){setTimeout(r,20000);}); i--; continue; }
+          var msgs = (mr && mr.data) || [];
+          if(msgs.length){ newTranscript = buildTranscript(msgs); transcriptSource = "re-fetched from Gorgias"; }
+        } catch(eF){ dbg("rescore","transcript refetch failed for #"+t.ticketId+": "+eF.message); }
+        if(!newTranscript) transcriptSource = "saved copy (Gorgias fetch failed)";
+      }
+      var scoringTranscript = newTranscript || t.transcript;
+      if(!scoringTranscript || scoringTranscript.trim().length<20){ out.skipped.push({t:t, why:"No transcript"}); continue; }
       try {
         var tags = t.ctfAsScored, tagSource = "as scored";
         if(!tags || !tags.contactReasonL1){
@@ -5039,7 +5117,7 @@ Rules:
           tags = {contactReasonL1:cr[0],contactReasonL2:cr[1],productL1:pr[0],productL2:pr[1],resolutionL1:rs[0],resolutionL2:rs[1],addResolutionL1:ad[0],addResolutionL2:ad[1]};
           tagSource = "current Gorgias";
         }
-        var ticketObj = Object.assign({}, t, tags, {
+        var ticketObj = Object.assign({}, t, tags, {transcript: scoringTranscript}, {
           contactReason: (tags.contactReasonL1&&tags.contactReasonL2&&tags.contactReasonL2!=="N/A") ? tags.contactReasonL1+"::"+tags.contactReasonL2 : (tags.contactReasonL1||t.contactReason)
         });
         var rawTxt = await callClaudeWithRetry(buildEvalPrompt(ticketObj));
@@ -5066,12 +5144,15 @@ Rules:
         var pendingDisputes = Object.keys(t.disputes||{}).filter(function(k){ return (t.disputes[k]||{}).status==="pending"; });
         out.items.push({t:t, parsed:parsed, newScores:newScores, sc:sc, newPct:newPct, newFinal:newFinal, oldFinal:oldFinal,
           oldAi:t.aiScore||0, oldPassed:oldPassed, newPassed:newPassed, autofail:autofail, changed:changed, tagSource:tagSource,
-          pendingDisputes:pendingDisputes, reviewed:!!t.reviewed, tags:tags});
+          pendingDisputes:pendingDisputes, reviewed:!!t.reviewed, tags:tags,
+          newTranscript:newTranscript, transcriptSource:transcriptSource, cutoffMode:isCutoff,
+          oldLen:String(t.transcript||"").length, aiLen:transcriptForAI(scoringTranscript).length});
       } catch(e){ out.errors.push({t:t, why:e.message}); }
       await new Promise(function(r){setTimeout(r,1000);});
     }
     var sel = {};
-    out.items.forEach(function(it){ if(it.changed.length || it.newFinal!==it.oldFinal) sel[it.t.rowId]=true; });  // default: everything that changed
+    // default: everything that changed — in the one-time cut-off fix, EVERY audit (saves the full transcript + marks it fixed)
+    out.items.forEach(function(it){ if(it.cutoffMode || it.changed.length || it.newFinal!==it.oldFinal) sel[it.t.rowId]=true; });
     setRsSelected(sel); setRsPreview(out); setRsStatus(""); setRsRunning(false);
     var nChanged = out.items.filter(function(it){return it.changed.length||it.newFinal!==it.oldFinal;}).length;
     addToast("Re-score preview ready — "+nChanged+" of "+out.items.length+" audits change");
@@ -5103,7 +5184,10 @@ Rules:
         if(!Array.isArray(prevHist)) prevHist=[];
         var hist = prevHist.concat([{
           version: prevHist.length+1, type: "system-matrix-rescore",
-          note: "Re-scored with saved matrix v"+matrixVersion+" (original audit scored with "+(t.matrixVersion?("v"+t.matrixVersion):"an unknown / fallback matrix")+")",
+          reason: it.cutoffMode ? "transcript-cutoff" : "matrix",
+          note: it.cutoffMode
+            ? ("Re-scored on the full transcript (one-time fix: v3.7 and earlier cut transcripts at 8,000 chars / 2,000 per HTML message). Transcript: "+(it.transcriptSource||"saved copy")+"; "+it.oldLen.toLocaleString()+" chars saved before; AI read "+it.aiLen.toLocaleString()+" chars.")
+            : ("Re-scored with saved matrix v"+matrixVersion+" (original audit scored with "+(t.matrixVersion?("v"+t.matrixVersion):"an unknown / fallback matrix")+")"),
           matrixVersionBefore: t.matrixVersion||null, matrixVersionAfter: matrixVersion,
           scoreBefore: it.oldFinal, scoreAfter: it.newFinal, aiScoreBefore: it.oldAi, aiScoreAfter: it.newPct,
           scoresBefore: t.aiScores||{}, categoryChanges: it.changed, tagSource: it.tagSource,
@@ -5119,6 +5203,7 @@ Rules:
         if(!t.autofailManual) patch.autofails = p.autofails||[];
         if(!keepComments && p.comments) patch.comments = p.comments;
         if(it.tagSource==="current Gorgias") patch.ctfAsScored = pickCtfTags(it.tags);   // record the tags this re-score used
+        if(it.newTranscript) patch.transcript = it.newTranscript;                       // v3.8.0: save the rebuilt full transcript
         var reopen = rsReopen && it.reviewed && (it.newFinal!==it.oldFinal || it.newPassed!==it.oldPassed);
         var reopenHist = null;
         if(reopen){
@@ -5132,6 +5217,7 @@ Rules:
           aiScores: it.newScores, scores: it.newScores, aiScore: it.newPct, finalScore: it.newFinal, passed: !it.autofail&&it.newPct>=85,
           disputedPassed: it.newPassed, autofail: it.autofail, autofails: patch.autofails||t.autofails, justifications: justif,
           comments: patch.comments||t.comments, reauditHistory: hist, matrixVersion: matrixVersion,
+          transcript: patch.transcript||t.transcript,
           reviewed: reopen ? false : t.reviewed, reopenHistoryJSON: reopen ? JSON.stringify(reopenHist) : t.reopenHistoryJSON
         });
         setTickets(function(ts){ return ts.map(function(x){ return x.rowId===t.rowId ? updated : x; }); });
@@ -5366,11 +5452,15 @@ Rules:
     html = html.replace(/<br\s*\/?>/gi,"\n");
     html = html.replace(/<\/?(p|div|li|tr|h[1-6])[^>]*>/gi,"\n");
     html = html.replace(/<[^>]+>/g,"");
-    html = html.replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">")
-               .replace(/&nbsp;/g," ").replace(/&#39;/g,"'").replace(/&quot;/g,'"');
+    // v3.8.0: decode ALL numeric entities (&#x27; &#8217; ...) and the common named ones, not just &#39; / &quot;
+    var NAMED = {nbsp:" ",quot:'"',apos:"'",lsquo:"'",rsquo:"'",ldquo:'"',rdquo:'"',hellip:"...",ndash:"-",mdash:"-",bull:"*",middot:"*",copy:"(c)",reg:"(R)",trade:"(TM)"};
+    html = html.replace(/&#x([0-9a-f]+);/gi,function(_,h){ var c=parseInt(h,16); return c?String.fromCodePoint(c):""; })
+               .replace(/&#(\d+);/g,function(_,d){ var c=parseInt(d,10); return c?String.fromCodePoint(c):""; })
+               .replace(/&(nbsp|quot|apos|lsquo|rsquo|ldquo|rdquo|hellip|ndash|mdash|bull|middot|copy|reg|trade);/g,function(_,n){ return NAMED[n]; })
+               .replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&amp;/g,"&");   // &amp; last so "&amp;lt;" stays literal
     html = html.replace(/On\s+(Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\n]*\d{4}[^\n]*:/gi,"");
     html = html.replace(/^>+\s?/gm,"");
-    return html.replace(/\s+/g," ").trim().slice(0,2000);
+    return html.replace(/\s+/g," ").trim();   // v3.8.0: no 2,000-char per-message cap (was .slice(0,2000))
   }
 
   function buildTranscript(messages) {
@@ -9972,6 +10062,25 @@ Rules:
               {settingsTab==="admin"&&isFullAccess&&(
                 <div>
                   <AutofailWindowPanel addToast={addToast} value={afWindow} onChange={setAfWindow}/>
+                  {/* One-time fix launcher (v3.8.0): audits scored on a cut-off transcript */}
+                  {isFullAccess&&(function(){
+                    var n = rsEligible("cutoff").length;
+                    return (
+                      <div style={{border:"1px solid "+(n?"var(--color-border-warning)":"var(--color-border-tertiary)"),background:n?"var(--color-background-warning)":"transparent",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
+                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:"12px",flexWrap:"wrap"}}>
+                          <div>
+                            <p style={{margin:"0 0 4px",fontSize:"13px",fontWeight:600}}>One-time fix: audits scored on a cut-off transcript</p>
+                            <p style={{margin:0,fontSize:"12px",color:"var(--color-text-secondary)",lineHeight:"1.55",maxWidth:"62ch"}}>
+                              Until v3.8, Wingman cut transcripts to 8,000 characters before scoring (and HTML emails to 2,000 characters per message),
+                              so long threads were scored without their latest replies. {n ? (n+" audit"+(n===1?"":"s")+" still need"+(n===1?"s":"")+" a re-score on the full conversation.") : "All affected audits have been re-scored."}
+                            </p>
+                          </div>
+                          {n>0&&<button onClick={function(){ setRsMode("cutoff"); setRsPreview(null); setTimeout(function(){ var el=document.getElementById("rescoreCard"); if(el) el.scrollIntoView({behavior:"smooth",block:"start"}); },50); }} style={btnInfo}>Set up re-score ({n})</button>}
+                        </div>
+                      </div>
+                    );
+                  })()}
+
                   {/* Database (Postgres) — import / verify / cutover. Full access only */}
                   {isFullAccess&&(
                     <div style={{border:"1px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
@@ -10066,14 +10175,14 @@ Rules:
                     var elig = rsEligible();
                     var busy = rsRunning||rsApplying;
                     var P = rsPreview;
-                    var changedItems = P ? P.items.filter(function(it){return it.changed.length||it.newFinal!==it.oldFinal;}) : [];
+                    var changedItems = P ? P.items.filter(function(it){return it.cutoffMode||it.changed.length||it.newFinal!==it.oldFinal;}) : [];  // cut-off fix lists every audit
                     var unchanged = P ? P.items.length-changedItems.length : 0;
                     var selCount = P ? P.items.filter(function(it){return rsSelected[it.t.rowId];}).length : 0;
                     var inp = {fontSize:"12px",padding:"6px 8px",border:"1px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)"};
                     var th = {padding:"6px 8px",textAlign:"left",fontSize:"11px",fontWeight:600,color:"var(--color-text-secondary)",borderBottom:"1px solid var(--color-border-tertiary)",whiteSpace:"nowrap"};
                     var td = {padding:"6px 8px",borderBottom:"1px solid var(--color-border-tertiary)",verticalAlign:"top"};
                     return (
-                    <div style={{border:"1px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
+                    <div id="rescoreCard" style={{border:"1px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
                       <p style={{margin:"0 0 4px",fontSize:"13px",fontWeight:600}}>Re-score with current matrix</p>
                       <p style={{margin:"0 0 12px",fontSize:"12px",color:"var(--color-text-secondary)",lineHeight:"1.55"}}>
                         Re-runs the full AI audit on saved audits using the saved matrix{matrixVersion?(" (v"+matrixVersion+")"):""}, exactly like {UI_LABELS.batch}.
@@ -10087,9 +10196,15 @@ Rules:
                           <div style={{display:"flex",gap:"12px",fontSize:"12px"}}>
                             <label style={{display:"flex",gap:"5px",alignItems:"center",cursor:"pointer"}}><input type="radio" checked={rsMode==="saved"} onChange={function(){setRsMode("saved");setRsPreview(null);}}/>Scored between</label>
                             <label style={{display:"flex",gap:"5px",alignItems:"center",cursor:"pointer"}}><input type="radio" checked={rsMode==="week"} onChange={function(){setRsMode("week");setRsPreview(null);}}/>Ticket week</label>
+                            <label style={{display:"flex",gap:"5px",alignItems:"center",cursor:"pointer"}}><input type="radio" checked={rsMode==="cutoff"} onChange={function(){setRsMode("cutoff");setRsPreview(null);}}/>Cut-off transcripts (one-time fix)</label>
                           </div>
                         </div>
-                        {rsMode==="saved" ? (
+                        {rsMode==="cutoff" ? (
+                          <p style={{margin:0,fontSize:"12px",color:"var(--color-text-secondary)",maxWidth:"52ch",lineHeight:"1.5"}}>
+                            All dates. Audits whose transcript was cut before scoring (v3.7 and earlier). Each conversation is re-fetched from Gorgias,
+                            saved in full, then re-scored. Audits already fixed this way are skipped, so this runs once.
+                          </p>
+                        ) : rsMode==="saved" ? (
                           <div style={{display:"flex",gap:"6px",alignItems:"center"}}>
                             <input type="date" value={rsFrom} onChange={function(e){setRsFrom(e.target.value);setRsPreview(null);}} style={inp} aria-label="From"/>
                             <span style={{fontSize:"12px",color:"var(--color-text-secondary)"}}>to</span>
@@ -10103,7 +10218,7 @@ Rules:
                         )}
                       </div>
                       <div style={{display:"flex",gap:"16px",flexWrap:"wrap",fontSize:"12px",marginBottom:"12px"}}>
-                        <label style={{display:"flex",gap:"6px",alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={rsOnlyStale} onChange={function(e){setRsOnlyStale(e.target.checked);setRsPreview(null);}}/>Skip audits already scored with v{matrixVersion||"?"}</label>
+                        {rsMode!=="cutoff"&&<label style={{display:"flex",gap:"6px",alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={rsOnlyStale} onChange={function(e){setRsOnlyStale(e.target.checked);setRsPreview(null);}}/>Skip audits already scored with v{matrixVersion||"?"}</label>}
                         <label style={{display:"flex",gap:"6px",alignItems:"center",cursor:"pointer"}}><input type="checkbox" checked={rsReopen} onChange={function(e){setRsReopen(e.target.checked);}}/>Reopen reviewed audits whose result changes</label>
                       </div>
                       <div style={{display:"flex",gap:"8px",alignItems:"center",marginBottom:"10px",flexWrap:"wrap"}}>
@@ -10144,6 +10259,7 @@ Rules:
                                     if(it.pendingDisputes.length) flags.push(it.pendingDisputes.length+" pending dispute"+(it.pendingDisputes.length!==1?"s":""));
                                     if(it.t.autofailManual) flags.push("manual autofail kept");
                                     if(it.tagSource!=="as scored") flags.push("tags from current Gorgias");
+                                    if(it.cutoffMode) flags.push(it.newTranscript ? ("full transcript re-fetched ("+it.oldLen.toLocaleString()+" → "+it.newTranscript.length.toLocaleString()+" chars saved)") : "Gorgias fetch failed — scored from the saved copy");
                                     return <tr key={it.t.rowId}>
                                       <td style={td}><input type="checkbox" checked={!!rsSelected[it.t.rowId]} aria-label={"Apply #"+it.t.ticketId} onChange={function(e){var v=e.target.checked;setRsSelected(function(s){var n=Object.assign({},s);if(v)n[it.t.rowId]=true;else delete n[it.t.rowId];return n;});}}/></td>
                                       <td style={td}>#{it.t.ticketId}</td>
