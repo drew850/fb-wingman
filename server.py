@@ -1,4 +1,4 @@
-# Wingman server — v3.7.0
+# Wingman server — v3.9.0
 # Storage: Postgres (DATABASE_URL). Notion is used ONLY by the one-time import + verify
 # jobs under /api/admin/*, server-side, and is never proxied for the browser.
 import os, json, re, urllib.request, urllib.error, secrets, hashlib, time, threading, queue, base64, traceback, uuid
@@ -16,7 +16,7 @@ except Exception as _imp_err:  # server still boots and reports the problem on /
     psycopg = None
     _PSYCOPG_IMPORT_ERROR = str(_imp_err)
 
-SERVER_VERSION      = "3.7.0"
+SERVER_VERSION      = "3.9.0"
 HTML_FILE           = "Wingman.html"
 PORT                = int(os.environ.get("PORT", 3747))
 DIR                 = os.path.dirname(os.path.abspath(__file__))
@@ -1635,18 +1635,21 @@ def last_run(kind):
 def manila_today():
     return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
 
-def autofail_window_state():
-    w = state_get("autofail_dispute_window") or {}
+# Windows are generic: "autofail_dispute_window" (v3.7.0, autofail disputes only, range optional) and
+# "dispute_unlock_window" (v3.9.0, ALL disputes — category + autofail — on locked audits in a required range).
+WINDOWS = {"autofail": {"key": "autofail_dispute_window", "range_required": False},
+           "disputes": {"key": "dispute_unlock_window",   "range_required": True}}
+
+def window_state(kind):
+    w = state_get(WINDOWS[kind]["key"]) or {}
     active = bool(w.get("open")) and bool(w.get("until")) and manila_today() <= w["until"]
-    return {"open": bool(w.get("open")), "active": active, "until": w.get("until", ""), "from": w.get("from", ""),
+    return {"kind": kind, "open": bool(w.get("open")), "active": active, "until": w.get("until", ""), "from": w.get("from", ""),
             "to": w.get("to", ""), "openedBy": w.get("openedBy", ""), "openedAt": w.get("openedAt", ""),
             "history": (w.get("history") or [])[-20:], "today": manila_today()}
 
-def api_autofail_window_get(h, user, pp, qs, body):
-    return autofail_window_state()
-
-def api_autofail_window_put(h, user, pp, qs, body):
-    w = state_get("autofail_dispute_window") or {}
+def window_put(kind, user, body):
+    key = WINDOWS[kind]["key"]
+    w = state_get(key) or {}
     want_open = bool(body.get("open"))
     until = c_text(body.get("until")).strip()[:10]
     frm, to = c_text(body.get("from")).strip()[:10], c_text(body.get("to")).strip()[:10]
@@ -1654,6 +1657,7 @@ def api_autofail_window_put(h, user, pp, qs, body):
     if want_open:
         if not re.fullmatch(date_rx, until): raise ApiError(400, "until must be a date (YYYY-MM-DD)")
         if until < manila_today(): raise ApiError(400, "the end date is in the past")
+        if WINDOWS[kind]["range_required"] and not (frm and to): raise ApiError(400, "choose the audit date range (from and to)")
     for d in (frm, to):
         if d and not re.fullmatch(date_rx, d): raise ApiError(400, "audit range dates must be YYYY-MM-DD")
     if frm and to and frm > to: raise ApiError(400, "audit range: 'from' is after 'to'")
@@ -1664,12 +1668,28 @@ def api_autofail_window_put(h, user, pp, qs, body):
     if want_open:
         new.update({"from": frm, "to": to})
         if not w.get("open"): new.update({"openedBy": user["name"], "openedAt": now_iso()})
-    state_set("autofail_dispute_window", new)
-    return autofail_window_state()
+    state_set(key, new)
+    return window_state(kind)
+
+def autofail_window_state():           # kept for compatibility
+    return window_state("autofail")
+
+def api_autofail_window_get(h, user, pp, qs, body):
+    return window_state("autofail")
+
+def api_autofail_window_put(h, user, pp, qs, body):
+    return window_put("autofail", user, body)
+
+def api_dispute_window_get(h, user, pp, qs, body):
+    return window_state("disputes")
+
+def api_dispute_window_put(h, user, pp, qs, body):
+    return window_put("disputes", user, body)
 
 def api_me(h, user, pp, qs, body):
     c = cutover_state()
-    return dict(user, ok=True, cutover=c, migrationMode=not c.get("done"), autofailWindow=autofail_window_state())
+    return dict(user, ok=True, cutover=c, migrationMode=not c.get("done"),
+                autofailWindow=window_state("autofail"), disputeWindow=window_state("disputes"))
 
 def api_users_list(h, user, pp, qs, body):
     if user.get("bootstrap") or role_rank(user["role"]) < 1:
@@ -2063,6 +2083,8 @@ ROUTES = [
     ("GET",    r"/gorgias/fields",                    api_gorgias_fields,       0, False),
     ("GET",    r"/settings/autofail-window",          api_autofail_window_get,  0, False),
     ("PUT",    r"/settings/autofail-window",          api_autofail_window_put,  2, True),
+    ("GET",    r"/settings/dispute-window",           api_dispute_window_get,   0, False),
+    ("PUT",    r"/settings/dispute-window",           api_dispute_window_put,   2, True),
     ("GET",    r"/users",                             api_users_list,           0, False),
     ("POST",   r"/users",                             api_users_create,         2, True),
     ("PATCH",  r"/users/" + UUID_RX,                  api_users_update,         2, True),
