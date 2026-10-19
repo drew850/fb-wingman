@@ -2,10 +2,16 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.13.0
+  Version:  3.14.0
   Date:     2026-10-20
 
   Changelog:
+  v3.14.0 (2026-10-20) -- RE-AUDIT OVERRIDE (Full only)
+    - When a re-audit finds no new messages, Full users get "Re-audit anyway" with a required reason. It re-fetches the
+      conversation and re-scores like a normal re-audit. The reason, who and when are logged in the re-audit history
+      entry and in the archived record's delete reason. Edit users still see "only available when new messages exist".
+    - The override screen warns when the audit has disputes (a re-audit replaces the audit, so disputes don't carry over).
+
   v3.13.0 (2026-10-20) -- BUILT-IN SCORING RULES MOVE TO THE MATRIX
     - The scoring POLICY that was hard-coded in the prompt (Jamie is evaluated; Gorgias Bot and Yuma are not; when to
       score NA; NA-except-CTF if the agent hasn't replied; score on what's in the transcript; only flag an autofail with
@@ -1073,7 +1079,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.13.0";
+const APP_VERSION = "v3.14.0";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -3247,6 +3253,7 @@ function App() {
   const [calibPending,setCalibPending]=useState(0);
   const [afWindow,setAfWindow]=useState(null);   // v3.7.0 autofail dispute window (from /api/me)
   const [duWindow,setDuWindow]=useState(null);
+  const [reauditOverrideReason,setReauditOverrideReason]=useState("");   // v3.14.0
   const [rulesMigrated,setRulesMigrated]=useState(false);   // v3.13.0: built-in policy moved into the Scoring context?
   const [migratingRules,setMigratingRules]=useState(false);
   const [calibView,setCalibView]=useState("category");   // v3.11.0 Team Calibration report: "category" | "ticket"   // v3.9.0 dispute unlock window — ALL disputes on locked audits in a range
@@ -3753,17 +3760,22 @@ function App() {
   }
 
   function handleReauditClick(ticket) {
+    setReauditOverrideReason("");   // v3.14.0: fresh reason each time
     console.log("[Reaudit][0] Re-audit clicked for ticket #"+ticket.ticketId);
     if(isTicketLocked(ticket)) { addToast("This ticket is locked ("+ticketLockDateLabel(ticket)+") — a Full-access user must unlock it first","error"); return; }
     // No pre-check on messageCount — missing count treated as 0, new message check handles it downstream
     setReauditModal({step:"confirm", ticket, newMsgCount:null, error:""});
   }
 
-  async function proceedReaudit() {
+  async function proceedReaudit(override) {
     var rm = reauditModal;
     if(!rm) return;
+    // v3.14.0: Full users can re-audit with no new messages ("Re-audit anyway"), with a required reason
+    override = !!override && isFullAccess && rm.step==="noNewMsgs";
+    var overrideReason = override ? String(reauditOverrideReason||"").trim() : "";
+    if(override && !overrideReason){ addToast("Give a reason for re-auditing without new messages","error"); return; }
 
-    if(rm.step==="confirm") {
+    if(rm.step==="confirm" || override) {
       // Step 1 — fetch messages from Gorgias
       console.log("[Reaudit][1] Fetching messages for ticket #"+rm.ticket.ticketId+"...");
       setReauditModal(function(r){return Object.assign({},r,{step:"fetching"});});
@@ -3772,7 +3784,7 @@ function App() {
         var msgs = msgResp.data||[];
         var newCount = msgs.length;
         console.log("[Reaudit][1] Current msgs:", newCount, "| Original:", rm.ticket.messageCount);
-        if(newCount <= (rm.ticket.messageCount||0)) {
+        if(newCount <= (rm.ticket.messageCount||0) && !override) {
           console.log("[Reaudit][1] No new messages — blocking re-audit");
           setReauditModal(function(r){return Object.assign({},r,{step:"noNewMsgs", newMsgCount:newCount});});
           return;
@@ -3842,6 +3854,9 @@ function App() {
           messages: rm.ticket.messageCount,
           auditedAt: rm.ticket.savedAt ? rm.ticket.savedAt.slice(0,10) : "",
           auditor:   rm.ticket.reviewer,
+          // v3.14.0: why it was re-audited when there were no new messages
+          override:  override || undefined, overrideReason: overrideReason || undefined,
+          overriddenBy: override ? currentUser.name : undefined, overriddenAt: override ? new Date().toISOString() : undefined,
         }]);
 
         var newRecord = {
@@ -3884,7 +3899,8 @@ function App() {
             deleted:      true,
             deletedBy:    currentUser.name,
             deletedAt:    new Date().toISOString(),
-            deleteReason: "Re-audited on "+new Date().toISOString().slice(0,10)+" — "+newCount+" messages",
+            deleteReason: "Re-audited on "+new Date().toISOString().slice(0,10)+" — "+newCount+" messages"
+                          +(override ? " (no new messages, override by "+currentUser.name+": "+overrideReason+")" : ""),
           });
         }
         console.log("[Reaudit][4] Archived. Saving new record...");
@@ -10824,8 +10840,25 @@ Rules:
                 <p style={{fontSize:"13px",color:"var(--color-text-secondary)",lineHeight:"1.6",margin:"0 0 8px"}}>
                   Ticket <span style={{fontFamily:"var(--font-mono)",fontWeight:600}}>#{reauditModal.ticket.ticketId}</span> still has <strong>{reauditModal.newMsgCount}</strong> messages — same as the last audit.
                 </p>
-                <p style={{fontSize:"12px",fontWeight:600,color:"var(--color-text-warning)",margin:"0 0 20px"}}>Re-audit is only available when new messages exist.</p>
-                <button onClick={function(){setReauditModal(null);}} style={{...ghost,padding:"10px 24px",fontSize:"13px"}}>Close</button>
+                {!isFullAccess ? (<>
+                  <p style={{fontSize:"12px",fontWeight:600,color:"var(--color-text-warning)",margin:"0 0 20px"}}>Re-audit is only available when new messages exist.</p>
+                  <button onClick={function(){setReauditModal(null);}} style={{...ghost,padding:"10px 24px",fontSize:"13px"}}>Close</button>
+                </>) : (<div style={{textAlign:"left",marginTop:"14px"}}>
+                  {/* v3.14.0: Full-user override */}
+                  <label style={lbl} htmlFor="reauditOverrideReason">Re-audit anyway? Reason (required, logged)</label>
+                  <textarea id="reauditOverrideReason" rows={2} value={reauditOverrideReason} onChange={function(e){setReauditOverrideReason(e.target.value);}}
+                    placeholder="e.g. Matrix updated since the last audit / first audit scored on a cut-off transcript"
+                    style={{width:"100%",boxSizing:"border-box",fontSize:"13px",lineHeight:"1.5",resize:"vertical"}}/>
+                  {(reauditModal.ticket.hasDisputes||Object.keys(reauditModal.ticket.disputes||{}).length>0)&&(
+                    <p style={{fontSize:"12px",color:"var(--color-text-warning)",margin:"8px 0 0",lineHeight:"1.5"}}>
+                      This audit has disputes. A re-audit replaces it with a fresh audit, so its disputes{reauditModal.ticket.reviewerNotes?" and reviewer notes":""} won't carry over (the old record is archived).
+                    </p>
+                  )}
+                  <div style={{display:"flex",gap:"10px",marginTop:"14px",justifyContent:"center"}}>
+                    <button onClick={function(){proceedReaudit(true);}} disabled={!reauditOverrideReason.trim()} style={{...btnInfo,padding:"10px 20px",fontSize:"13px",opacity:reauditOverrideReason.trim()?1:0.5}}>Re-audit anyway</button>
+                    <button onClick={function(){setReauditModal(null);}} style={{...ghost,padding:"10px 24px",fontSize:"13px"}}>Close</button>
+                  </div>
+                </div>)}
               </div>
             </>)}
 
