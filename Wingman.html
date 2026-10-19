@@ -2,10 +2,25 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.11.0
-  Date:     2026-10-16
+  Version:  3.12.0
+  Date:     2026-10-20
 
   Changelog:
+  v3.12.0 (2026-10-20) -- AUTOFAIL EVIDENCE + SYSTEM-EMAIL RULE
+    - Prompt rule (built in, applies to every audit and re-score): system emails (return labels, order / refund /
+      cancellation confirmations) never appear in the transcript, so their absence is not an undelivered promise.
+      Prompted by a false "failed to deliver a promised resolution" autofail where the agent had set up the return and
+      the USPS label email was sent by the returns system.
+    - Autofail evidence: for every autofail the AI lists it must return {condition, message header, short exact quote,
+      how each part of the condition is met}; if it can't point to a specific message it must not flag the autofail.
+      Saved in ai_meta.autofailEvidence on every scoring path (AI Audit, re-audit, Manual, Delete & Replace, re-score);
+      entries for conditions the AI didn't list are dropped. Shown in Review's Autofail card ("Why the AI flagged this",
+      kept as "Why the AI originally flagged this" after removal) and included with autofail disputes in AI Calibration.
+      Audits scored before v3.12 have no evidence until re-scored.
+    - FIX: a just-saved Manual Audit showed "Condition: —" and "rubric 0%" in Review until the page was reloaded
+      (it was added to the screen without the fields the loader reads). AI Audit / Delete & Replace results now carry
+      aiMeta immediately too.
+
   v3.11.0 (2026-10-16) -- TEAM CALIBRATION: BY-TICKET VIEW
     - The report has two views (tabs in the app): By category (v3.10) and By ticket. The exported .doc includes both.
     - By ticket, least agreement first (ties broken by most tied categories, then widest score spread): ticket, agent and
@@ -1044,7 +1059,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.11.0";
+const APP_VERSION = "v3.12.0";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -1306,7 +1321,8 @@ async function saveTicketToDb(ticket) {
     maxPoints:         ticket.maxPoints==null?null:ticket.maxPoints,
     replacedFor:       ticket.replacedFor||"",
     customerEmail:     ticket.customerEmail||"",
-    aiMeta:            (ticket.product||ticket.ticketResolution) ? {product:ticket.product||"", ticketResolution:ticket.ticketResolution||""} : null,
+    aiMeta:            (ticket.product||ticket.ticketResolution||(ticket.autofailEvidence||[]).length) ? {product:ticket.product||"", ticketResolution:ticket.ticketResolution||"",
+                        autofailEvidence: ticket.autofailEvidence||[]} : null,   // v3.12.0: why the AI flagged an autofail
     ctfAsScored:       ticket.ctfAsScored||null,
     matrixVersion:     CURRENT_MATRIX_VERSION,
   };
@@ -1436,7 +1452,9 @@ function parseTicketRow(r) {
     maxPoints: r.maxPoints==null ? null : r.maxPoints,
     replacedFor: r.replacedFor || "",
     customerEmail: r.customerEmail || "",
-    aiMeta: r.aiMeta || null,
+    // v3.12.0: a just-scored result carries product / ticketResolution / autofailEvidence at the top level
+    aiMeta: r.aiMeta || ((r.product||r.ticketResolution||(r.autofailEvidence||[]).length)
+            ? {product:r.product||"", ticketResolution:r.ticketResolution||"", autofailEvidence:r.autofailEvidence||[]} : null),
     ctfAsScored: r.ctfAsScored || null,
     matrixVersion: r.matrixVersion==null ? null : r.matrixVersion,
     snapshotStatus: r.snapshotStatus || "none",
@@ -2993,6 +3011,26 @@ function calibPromptPayload(data, matrix, A){
   };
 }
 
+// v3.12.0: why the AI flagged an autofail — [{condition, message, quote, reasoning}], one per listed autofail.
+// Kept only for conditions the AI actually listed (after normalizeAutofails), so stray entries never imply a flag.
+function normalizeAutofailEvidence(ev, autofails){
+  if(!Array.isArray(ev) || !(autofails||[]).length) return [];
+  var listed = (autofails||[]).map(function(a){ return String(a).toLowerCase().trim(); });
+  return ev.filter(function(e){ return e && typeof e==="object"; }).map(function(e){
+    return { condition: String(e.condition||"").trim(), message: String(e.message||"").trim(),
+             quote: String(e.quote||"").trim(), reasoning: String(e.reasoning||"").trim() };
+  }).filter(function(e){
+    var c = e.condition.toLowerCase();
+    return (e.quote||e.reasoning) && listed.some(function(l){ return l===c || l.indexOf(c)>=0 || c.indexOf(l)>=0; });
+  });
+}
+
+// v3.12.0: results added straight to state (AI Audit, Delete & Replace) need aiMeta for Review's autofail evidence
+function withAiMeta(r){
+  if(!r || r.aiMeta) return r;
+  if(r.product||r.ticketResolution||(r.autofailEvidence||[]).length) r.aiMeta = {product:r.product||"", ticketResolution:r.ticketResolution||"", autofailEvidence:r.autofailEvidence||[]};
+  return r;
+}
 function allTrue(arr){ var o={}; arr.forEach(function(k){ o[k]=true; }); return o; }
 
 // Reusable checkbox multi-select dropdown for the Fetch tab. Driven by a {value:true} map;
@@ -3643,6 +3681,7 @@ function App() {
     var parsed = JSON.parse(jsonMatch[0]);
     var sc = calcScore(parsed.scores||{}, matrix);
     parsed.autofails = normalizeAutofails(parsed.autofails);   // v3.6.1
+        parsed.autofailEvidence = normalizeAutofailEvidence(parsed.autofailEvidence, parsed.autofails);   // v3.12.0
     var hasAF = (parsed.autofails||[]).length > 0;
 
     var newResult = {
@@ -3659,7 +3698,7 @@ function App() {
       ticketResolution: parsed.meta&&parsed.meta.ticketResolution||"",
       scores:        parsed.scores||{},
       aiScores:      parsed.scores||{},
-      autofails:     parsed.autofails||[],
+      autofails:     parsed.autofails||[], autofailEvidence: parsed.autofailEvidence||[],
       autofail:      hasAF,
       comments:      parsed.comments||"",
       totalPoints:   sc?sc.pts:0,
@@ -3679,7 +3718,7 @@ function App() {
     console.log("[Replace][4] Saving replacement to database. Auditor:", auditor, "Passed:", newResult.passed);
     var savedR = await saveTicketToDb(newResult);
     if(savedR && savedR.id){ newResult.rowId = savedR.id; newResult.id = savedR.id; }
-    setTickets(function(prev){return prev.concat([newResult]);});
+    setTickets(function(prev){return prev.concat([withAiMeta(newResult)]);});
     console.log("[Replace][4] Saved successfully (pageId:", newResult.rowId+")");
     return newResult;
   }
@@ -3759,6 +3798,7 @@ function App() {
         var parsed = JSON.parse(jsonMatch[0]);
         var sc = calcScore(parsed.scores||{}, matrix);
         parsed.autofails = normalizeAutofails(parsed.autofails);   // v3.6.1
+        parsed.autofailEvidence = normalizeAutofailEvidence(parsed.autofailEvidence, parsed.autofails);   // v3.12.0
         var hasAF = (parsed.autofails||[]).length > 0;
         // Re-audit re-scores the SAME ticket, so its week must not change. Prefer the stored
         // week (preserves any manual correction) and only re-derive as a fallback.
@@ -3786,7 +3826,7 @@ function App() {
           subject:       rm.ticket.subject,
           scores:        parsed.scores||{},
           aiScores:      parsed.scores||{},
-          autofails:     parsed.autofails||[],
+          autofails:     parsed.autofails||[], autofailEvidence: parsed.autofailEvidence||[],
           autofail:      hasAF,
           comments:      parsed.comments||"",
           totalPoints:   sc?sc.pts:0,
@@ -3998,7 +4038,9 @@ function App() {
 +(scoringContext&&scoringContext.trim()?"- WORKFLOW & CONTEXT NOTES:\n"+scoringContext.trim()+"\n":"")
       +"CATEGORIES:\n"+rubric+"\n\n"
       +"AUTOFAILS:\n"+afLines+"\n"
-      +"In \"autofails\" list ONLY the conditions that apply, each as its exact text (plain strings). If none apply return []. Never list conditions that do not apply.\n\n"
+      +"In \"autofails\" list ONLY the conditions that apply, each as its exact text (plain strings). If none apply return []. Never list conditions that do not apply.\n"
+      +"For EVERY autofail you list, add an entry to \"autofailEvidence\": the condition, the header of the message that triggers it (e.g. [Agent - May L. @ 2026-10-19 01:08]), a short exact quote from that message, and how each part of the condition is met. If you cannot point to a specific message that proves the condition, do NOT list the autofail.\n"
+      +"Emails sent by systems (return labels, order / refund / cancellation confirmations) do not appear in the transcript. Their absence is NOT evidence of an undelivered promise — when the agent says one has been sent or is on its way, treat it as delivered unless the transcript shows otherwise.\n\n"
       +"TICKET ID: "+ticket.ticketId+"\n"
       +"AGENT: "+ticket.agentName+"\n"
       +"SUBJECT: "+ticket.contactReason+"\n\n"
@@ -4012,6 +4054,7 @@ function App() {
       +'"scores":{'+scoresSchema+'},'
       +'"justifications":{'+justSchema+'},'
       +'"autofails":["<exact text of each AUTOFAIL condition that applies; [] if none>"],'
+      +'"autofailEvidence":[{"condition":"<same exact text>","message":"<[Role - Name @ time] of the triggering message>","quote":"<short exact quote>","reasoning":"<how each part of the condition is met, 1-2 sentences>"}],'
       +'"comments":"+ [key strength observation]\\n- [key improvement observation]"}';
   }
 
@@ -4059,6 +4102,7 @@ function App() {
         var parsed=JSON.parse(jsonMatch[0]);
         var sc=calcScore(parsed.scores||{},matrix);
         parsed.autofails = normalizeAutofails(parsed.autofails);   // v3.6.1
+        parsed.autofailEvidence = normalizeAutofailEvidence(parsed.autofailEvidence, parsed.autofails);   // v3.12.0
         var hasAF=(parsed.autofails||[]).length>0;
         newResult={
           id:Date.now()+i,week:ticketWeekLabel(ticket.createdDate)||week,auditWeek:week,
@@ -4068,7 +4112,7 @@ function App() {
           contactReason:parsed.meta?.contactReason||ticket.contactReason,
           product:parsed.meta?.product||"",ticketResolution:parsed.meta?.ticketResolution||"",
           scores:parsed.scores||{},aiScores:parsed.scores||{},
-          autofails:parsed.autofails||[],autofail:hasAF,
+          autofails:parsed.autofails||[],autofailEvidence:parsed.autofailEvidence||[],autofail:hasAF,
           comments:parsed.comments||"",
           totalPoints:sc?sc.pts:0,maxPoints:sc?sc.max:0,
           finalScore:(hasAF?0:(sc?sc.pct:0)) /* v3.5.0: autofail = 0% */,aiScore:(hasAF?0:(sc?sc.pct:0)),
@@ -4087,7 +4131,7 @@ function App() {
         try {
           var savedA = await saveTicketToDb(newResult);
           if(savedA && savedA.id){ newResult.rowId = savedA.id; newResult.id = savedA.id; }
-          setTickets(function(prev){return prev.concat([newResult]);});
+          setTickets(function(prev){return prev.concat([withAiMeta(newResult)]);});
         } catch(saveErr) {
           dbg("batch","save FAILED for #"+ticket.ticketId+": "+saveErr.message);
           console.error("Save failed for",ticket.ticketId,saveErr);
@@ -5443,6 +5487,7 @@ Rules:
         var newScores = parsed.scores||{};
         var sc = calcScore(newScores, matrix);
         parsed.autofails = normalizeAutofails(parsed.autofails);   // v3.6.1
+        parsed.autofailEvidence = normalizeAutofailEvidence(parsed.autofailEvidence, parsed.autofails);   // v3.12.0
         var aiAutofails = parsed.autofails;
         var autofail = t.autofailManual ? true : aiAutofails.length>0;
         var newPct = autofail ? 0 : (sc?sc.pct:0);      // v3.5.0: autofail = 0%
@@ -5513,7 +5558,7 @@ Rules:
           aiPassed: !it.autofail && it.newPct>=85, finalPassed: it.newPassed,
           autofail: it.autofail, justifications: justif, reauditHistory: hist,
           totalPoints: it.sc?it.sc.pts:0, maxPoints: it.sc?it.sc.max:0, matrixVersion: matrixVersion,
-          aiMeta: p.meta ? {product:p.meta.product||"", ticketResolution:p.meta.ticketResolution||""} : undefined
+          aiMeta: {product:(p.meta&&p.meta.product)||"", ticketResolution:(p.meta&&p.meta.ticketResolution)||"", autofailEvidence: p.autofailEvidence||[]}
         };
         if(!t.autofailManual) patch.autofails = p.autofails||[];
         if(!keepComments && p.comments) patch.comments = p.comments;
@@ -5532,7 +5577,7 @@ Rules:
           aiScores: it.newScores, scores: it.newScores, aiScore: it.newPct, finalScore: it.newFinal, passed: !it.autofail&&it.newPct>=85,
           disputedPassed: it.newPassed, autofail: it.autofail, autofails: patch.autofails||t.autofails, justifications: justif,
           comments: patch.comments||t.comments, reauditHistory: hist, matrixVersion: matrixVersion,
-          transcript: patch.transcript||t.transcript,
+          transcript: patch.transcript||t.transcript, aiMeta: patch.aiMeta||t.aiMeta,
           reviewed: reopen ? false : t.reviewed, reopenHistoryJSON: reopen ? JSON.stringify(reopenHist) : t.reopenHistoryJSON
         });
         setTickets(function(ts){ return ts.map(function(x){ return x.rowId===t.rowId ? updated : x; }); });
@@ -6480,6 +6525,7 @@ Rules:
       var parsed = JSON.parse(jsonMatch[0]);
       var sc = calcScore(parsed.scores||{}, matrix);
       parsed.autofails = normalizeAutofails(parsed.autofails);   // v3.6.1
+        parsed.autofailEvidence = normalizeAutofailEvidence(parsed.autofailEvidence, parsed.autofails);   // v3.12.0
       var hasAF = (parsed.autofails||[]).length>0;
       // Same shape as an AI Audit result (see runBatchQA) — only auditType differs
       var result = {
@@ -6487,7 +6533,7 @@ Rules:
         reviewer: currentUser.name, agentName: ticket.agentName, ticketId: String(ticket.ticketId), ticketUrl: ticket.ticketUrl,
         createdDate: ticket.createdDate||"", contactReason: (parsed.meta&&parsed.meta.contactReason)||ticket.contactReason,
         product: (parsed.meta&&parsed.meta.product)||"", ticketResolution: (parsed.meta&&parsed.meta.ticketResolution)||"",
-        scores: parsed.scores||{}, aiScores: parsed.scores||{}, autofails: parsed.autofails||[], autofail: hasAF,
+        scores: parsed.scores||{}, aiScores: parsed.scores||{}, autofails: parsed.autofails||[], autofailEvidence: parsed.autofailEvidence||[], autofail: hasAF,
         comments: parsed.comments||"", totalPoints: sc?sc.pts:0, maxPoints: sc?sc.max:0,
         finalScore: (hasAF?0:(sc?sc.pct:0)) /* v3.5.0: autofail = 0% */, aiScore: (hasAF?0:(sc?sc.pct:0)), passed: !hasAF&&(sc?sc.pct:0)>=85,
         hasDisputes: false, disputes: {}, justifications: parsed.justifications||{},
@@ -6498,7 +6544,11 @@ Rules:
       setManualStatus("Saving…");
       var saved = await saveTicketToDb(result);
       result.rowId = saved.id; result.id = saved.id;
-      setTickets(function(ts){ return [parseTicketRow(Object.assign({pageId:saved.id}, result))].concat(ts); });
+      // v3.12.0: pass the JSON fields parseTicketRow reads (as Re-audit does) — without them the new audit showed
+      // "Condition: —" and "rubric 0%" in Review until a reload
+      setTickets(function(ts){ return [parseTicketRow(Object.assign({pageId:saved.id}, result, {
+        scoresJSON: JSON.stringify(result.aiScores||result.scores||{}), justificationsJSON: JSON.stringify(result.justifications||{}),
+        autofailsJSON: JSON.stringify(result.autofails||[]), disputesJSON: "{}" }))].concat(ts); });
       setManualResult(result);
       addToast("Manual audit saved — "+result.aiScore+"%");
     } catch(e){ addToast("Error: "+e.message,"error"); }
@@ -6515,7 +6565,8 @@ Rules:
       var disputeData=disputed.map(function(t){
         var cats=Object.entries(t.disputes||{}).map(function(e){
           var catId=e[0],d=e[1];
-          return {category:disputeLabel(catId,matrix),aiScore:catId===AUTOFAIL_DISPUTE_KEY?("AUTOFAIL: "+(d.condition||"")):(t.aiScores&&t.aiScores[catId]),finalScore:d.finalScore,justification:d.justification};
+          var afEv = catId===AUTOFAIL_DISPUTE_KEY ? ((t.aiMeta&&t.aiMeta.autofailEvidence)||[]).map(function(e){ return e.message+" \""+e.quote+"\" — "+e.reasoning; }).join(" | ") : "";
+          return {category:disputeLabel(catId,matrix),aiScore:catId===AUTOFAIL_DISPUTE_KEY?("AUTOFAIL: "+(d.condition||"")+(afEv?" — AI evidence: "+afEv:"")):(t.aiScores&&t.aiScores[catId]),finalScore:d.finalScore,justification:d.justification};
         });
         return {ticketId:t.ticketId,agent:t.agentName,contactReason:t.contactReason,disputes:cats};
       });
@@ -7988,6 +8039,20 @@ Rules:
                       </div>
                       {badge&&<span style={{fontSize:"11px",fontWeight:600,padding:"2px 9px",borderRadius:"999px",background:badge.bg,color:badge.c,whiteSpace:"nowrap"}}>{badge.t}</span>}
                     </div>
+                    {/* v3.12.0: why the AI flagged it (saved with the audit) */}
+                    {((reviewSelected.aiMeta&&reviewSelected.aiMeta.autofailEvidence)||[]).length>0&&(
+                      <div style={{marginTop:"12px"}}>
+                        <p style={{margin:"0 0 6px",fontSize:"12px",fontWeight:600,color:"var(--color-text-secondary)"}}>{reviewSelected.autofail?"Why the AI flagged this":"Why the AI originally flagged this"}</p>
+                        {reviewSelected.aiMeta.autofailEvidence.map(function(e,i){
+                          return <div key={i} style={{padding:"10px 12px",borderRadius:"var(--border-radius-md)",border:"1px solid var(--color-border-tertiary)",marginBottom:"6px",fontSize:"13px",lineHeight:"1.55"}}>
+                            {e.message&&<div style={{fontSize:"12px",color:"var(--color-text-secondary)",marginBottom:"2px"}}>{e.message}</div>}
+                            {e.quote&&<div style={{borderLeft:"3px solid "+T.red.border,paddingLeft:"10px",margin:"2px 0 6px",fontStyle:"italic"}}>“{e.quote}”</div>}
+                            {e.reasoning&&<div>{e.reasoning}</div>}
+                            {e.condition&&reviewSelected.aiMeta.autofailEvidence.length>1&&<div style={{fontSize:"12px",color:"var(--color-text-secondary)",marginTop:"4px"}}>Condition: {e.condition}</div>}
+                          </div>;
+                        })}
+                      </div>
+                    )}
                     {windowCovers&&(reviewSelected.autofail||st==="pending")&&(
                       <div style={{marginTop:"10px",fontSize:"12px",color:"var(--color-text-info)"}}>
                         This audit is locked, but the autofail dispute window is open until {fmtDay(afWindow.until)}, so its autofail can be {isViewOnly?"disputed":"decided"}.
