@@ -2,10 +2,24 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.12.0
+  Version:  3.13.0
   Date:     2026-10-20
 
   Changelog:
+  v3.13.0 (2026-10-20) -- BUILT-IN SCORING RULES MOVE TO THE MATRIX
+    - The scoring POLICY that was hard-coded in the prompt (Jamie is evaluated; Gorgias Bot and Yuma are not; when to
+      score NA; NA-except-CTF if the agent hasn't replied; score on what's in the transcript; only flag an autofail with
+      a specific proving message) is now one list, BUILTIN_SCORING_RULES. Matrix page (Full only) shows a "Built-in
+      rules still in code" card with "Move built-in rules to Scoring context": appends them to the Scoring context,
+      saves, then sets config "rulesMigrated" = true — after which the prompt no longer sends them, so they come only
+      from the matrix. Until moved, scoring is unchanged.
+    - Stays in code (describes what Wingman does to the data, not policy): quoted-email removal note, encoding note,
+      the per-ticket agent name, the answer format and the evidence format.
+
+  v3.12.1 (2026-10-20) -- Removed the hard-coded system-email rule from the scoring prompt; it now lives in the matrix
+    Scoring context (saved as matrix v4), so it's visible and editable and isn't sent twice. Policy: scoring rules go
+    in the matrix, not in code.
+
   v3.12.0 (2026-10-20) -- AUTOFAIL EVIDENCE + SYSTEM-EMAIL RULE
     - Prompt rule (built in, applies to every audit and re-score): system emails (return labels, order / refund /
       cancellation confirmations) never appear in the transcript, so their absence is not an undelivered promise.
@@ -1059,7 +1073,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.12.0";
+const APP_VERSION = "v3.13.0";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -3031,6 +3045,19 @@ function withAiMeta(r){
   if(r.product||r.ticketResolution||(r.autofailEvidence||[]).length) r.aiMeta = {product:r.product||"", ticketResolution:r.ticketResolution||"", autofailEvidence:r.autofailEvidence||[]};
   return r;
 }
+// v3.13.0: scoring POLICY that used to be hard-coded in the prompt. Sent by code only until a Full user moves it into
+// the matrix Scoring context (Matrix page > "Move built-in rules to Scoring context"); after that (config key
+// "rulesMigrated" = true) it comes only from the matrix, where it can be edited. Technical instructions that describe
+// what Wingman does to the data (quote removal, encoding, agent name, answer format) stay in code.
+var BUILTIN_SCORING_RULES = [
+  "Freedom Grooming uses Jamie as an AI customer service agent. Jamie IS an agent and is evaluated like any other agent when assigned.",
+  "Gorgias Bot only sends the auto-acknowledgment reply. Do not evaluate Gorgias Bot messages.",
+  "Yuma is an escalation system. Do not evaluate Yuma messages.",
+  "Score NA only when a category genuinely does not apply (e.g. no order cancellation = NA for that category).",
+  "If the agent being evaluated has not replied yet, score all categories NA except CTF.",
+  "Score based on what IS in the transcript.",
+  "Only flag an autofail when you can point to a specific message that proves it."
+];
 function allTrue(arr){ var o={}; arr.forEach(function(k){ o[k]=true; }); return o; }
 
 // Reusable checkbox multi-select dropdown for the Fetch tab. Driven by a {value:true} map;
@@ -3220,6 +3247,8 @@ function App() {
   const [calibPending,setCalibPending]=useState(0);
   const [afWindow,setAfWindow]=useState(null);   // v3.7.0 autofail dispute window (from /api/me)
   const [duWindow,setDuWindow]=useState(null);
+  const [rulesMigrated,setRulesMigrated]=useState(false);   // v3.13.0: built-in policy moved into the Scoring context?
+  const [migratingRules,setMigratingRules]=useState(false);
   const [calibView,setCalibView]=useState("category");   // v3.11.0 Team Calibration report: "category" | "ticket"   // v3.9.0 dispute unlock window — ALL disputes on locked audits in a range
   const [manualLoaded,setManualLoaded]=useState(null);       // {ticket, warnings[], alreadyAudited, noTranscript}
   const [manualLoading,setManualLoading]=useState(false);
@@ -4027,20 +4056,17 @@ function App() {
       +"Interpret these as their intended characters (smart quotes, apostrophes) and evaluate normally.\n\n"
       +"IMPORTANT CONTEXT:\n"
       +"- Each message shows only what was newly written; quoted earlier emails were removed to save space (marked [earlier quoted emails removed]). Do NOT treat that as an incomplete or cut-off reply.\n"
-      +"- Freedom Grooming uses Jamie as their AI customer service agent — Jamie IS the agent being evaluated\n"
-      +"- Gorgias Bot sends only the auto-acknowledgment reply — do NOT evaluate Gorgias Bot\n"
-      +"- Yuma is an escalation system — do NOT evaluate Yuma messages\n"
+      +(rulesMigrated ? "" : (BUILTIN_SCORING_RULES.slice(0,3).map(function(r){ return "- "+r+"\n"; }).join("")))   // v3.13.0: policy (moved to the matrix once migrated)
+      +""  /* v3.13.0: Jamie / Gorgias Bot / Yuma lines now come from BUILTIN_SCORING_RULES or the matrix */
       +"- The AGENT to evaluate is: "+ticket.agentName+"\n"
       +"- If "+ticket.agentName+" has replied in the transcript, evaluate their response\n"
-      +"- Score NA only when a category genuinely does not apply (e.g. no order cancellation = NA for that category)\n"
-      +"- If the agent named above has NOT replied yet, score all categories NA except CTF\n"
-      +"- Score based on what IS in the transcript\n"
+      +(rulesMigrated ? "" : (BUILTIN_SCORING_RULES.slice(3,6).map(function(r){ return "- "+r+"\n"; }).join("")))   // v3.13.0: policy
 +(scoringContext&&scoringContext.trim()?"- WORKFLOW & CONTEXT NOTES:\n"+scoringContext.trim()+"\n":"")
       +"CATEGORIES:\n"+rubric+"\n\n"
       +"AUTOFAILS:\n"+afLines+"\n"
       +"In \"autofails\" list ONLY the conditions that apply, each as its exact text (plain strings). If none apply return []. Never list conditions that do not apply.\n"
-      +"For EVERY autofail you list, add an entry to \"autofailEvidence\": the condition, the header of the message that triggers it (e.g. [Agent - May L. @ 2026-10-19 01:08]), a short exact quote from that message, and how each part of the condition is met. If you cannot point to a specific message that proves the condition, do NOT list the autofail.\n"
-      +"Emails sent by systems (return labels, order / refund / cancellation confirmations) do not appear in the transcript. Their absence is NOT evidence of an undelivered promise — when the agent says one has been sent or is on its way, treat it as delivered unless the transcript shows otherwise.\n\n"
+      +"For EVERY autofail you list, add an entry to \"autofailEvidence\": the condition, the header of the message that triggers it (e.g. [Agent - May L. @ 2026-10-19 01:08]), a short exact quote from that message, and how each part of the condition is met.\n"+(rulesMigrated ? "" : ("- "+BUILTIN_SCORING_RULES[6]+"\n"))   /* v3.13.0: policy part moved out */
+      +"\n"   /* v3.12.1: system-email rule now lives in the matrix Scoring context (editable) — not hard-coded */
       +"TICKET ID: "+ticket.ticketId+"\n"
       +"AGENT: "+ticket.agentName+"\n"
       +"SUBJECT: "+ticket.contactReason+"\n\n"
@@ -7068,6 +7094,8 @@ Rules:
       if(savedMatrix && Array.isArray(savedMatrix)) { setMatrix(savedMatrix); setMatrixVersion(CURRENT_MATRIX_VERSION); }
       var savedAutofails = await loadConfigFromDb("autofails");
       if(savedAutofails && Array.isArray(savedAutofails)) setAutofailList(savedAutofails);
+      var savedRulesMigrated = await loadConfigFromDb("rulesMigrated");   // v3.13.0
+      setRulesMigrated(savedRulesMigrated===true);
       var savedScoringContext = await loadConfigFromDb("scoringContext");
       if(savedScoringContext && typeof savedScoringContext === "string") setScoringContext(savedScoringContext);
       setMatrixSnapPending(true);   // snapshot the loaded matrix once state has committed (see effect)
@@ -7104,6 +7132,25 @@ Rules:
     } finally {
       setSyncing(false);
     }
+  }
+
+  // v3.13.0: one-time move of the built-in scoring policy into the matrix Scoring context
+  async function migrateBuiltInRules(){
+    if(!isFullAccess || rulesMigrated) return;
+    var dirtyNow = matrixSnapshot!==null && JSON.stringify({m:matrix,a:autofailList,c:scoringContext})!==matrixSnapshot;
+    if(dirtyNow){ addToast("Save or discard your matrix edits first","error"); return; }
+    if(!window.confirm("Append these "+BUILTIN_SCORING_RULES.length+" rules to the Scoring context and save?\n\nAfter this the code stops sending them — they come only from the matrix, where you can edit them.")) return;
+    setMigratingRules(true);
+    try {
+      var block = BUILTIN_SCORING_RULES.map(function(r){ return "- "+r; }).join("\n");
+      var next = (scoringContext||"").replace(/\s+$/,"") + (scoringContext&&scoringContext.trim() ? "\n\n" : "") + block;
+      await saveConfigToDb("scoringContext", next);
+      await saveConfigToDb("rulesMigrated", true);       // only after the rules are safely in the matrix
+      setScoringContext(next); setRulesMigrated(true);
+      setMatrixSnapshot(JSON.stringify({m:matrix,a:autofailList,c:next}));
+      addToast("Built-in rules moved to the Scoring context");
+    } catch(e){ addToast("Move failed: "+e.message,"error"); }
+    setMigratingRules(false);
   }
 
   async function saveMatrix() {
@@ -9673,6 +9720,16 @@ Rules:
             )}
           </div>
 
+          {/* v3.13.0: one-time move of built-in scoring rules into the Scoring context (Full only, until done) */}
+          {canEdit&&!rulesMigrated&&(
+            <section className="wm-mx" style={{borderColor:"var(--color-border-warning)",background:"var(--color-background-warning)"}}>
+              <div className="wm-mx-head" style={{borderBottomColor:"var(--color-border-warning)"}}><h3>Built-in rules still in code</h3>
+                <div className="wm-mx-actions"><button onClick={migrateBuiltInRules} disabled={migratingRules} style={{...btnInfo,opacity:migratingRules?0.5:1}}>{migratingRules?"Moving…":"Move built-in rules to Scoring context"}</button></div></div>
+              <p className="wm-mx-sub" style={{color:"var(--color-text-warning)"}}>Sent to the AI on every audit, but not visible or editable here</p>
+              <ul style={{margin:"0 0 0 18px",padding:0,fontSize:"13.5px",lineHeight:"1.65"}}>{BUILTIN_SCORING_RULES.map(function(r,i){ return <li key={i}>{r}</li>; })}</ul>
+              <p style={{margin:"10px 0 0",fontSize:"12px",color:"var(--color-text-secondary)"}}>Moving appends them to the Scoring context below and saves. From then on they come only from the matrix, so you can edit or remove them like any other rule.</p>
+            </section>
+          )}
           {/* Scoring context — injected into every AI scoring prompt */}
           <section className="wm-mx">
             <div className="wm-mx-head"><h3>Scoring context</h3><div className="wm-mx-actions">{editBtn("__context")}</div></div>
