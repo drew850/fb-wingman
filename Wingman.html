@@ -2,10 +2,18 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.10.0
+  Version:  3.11.0
   Date:     2026-10-16
 
   Changelog:
+  v3.11.0 (2026-10-16) -- TEAM CALIBRATION: BY-TICKET VIEW
+    - The report has two views (tabs in the app): By category (v3.10) and By ticket. The exported .doc includes both.
+    - By ticket, least agreement first (ties broken by most tied categories, then widest score spread): ticket, agent and
+      contact reason, agreement pill + measured %, "Splits on: ..." with ties marked, totals range, original auditor;
+      grid of scored categories x the auditors who reviewed it, Original column, Agreed / Split per row, then each
+      reviewer's Total score (same rule as calcScore) and Autofail call. Categories everyone marked N/A are folded into a
+      note. Calculated from the reviews only — no extra AI call, so it works on any v3.10+ round without re-running.
+
   v3.10.0 (2026-10-16) -- TEAM CALIBRATION REPORT REDESIGN (approved prototype wingman_calibration_prototype.html)
     - FIX: the calibration prompt sent pretty-printed JSON cut at 12,000 characters, so later tickets and reviews were
       dropped (the Sep 28 - Oct 4 report said "11 reviews across 3 tickets" for a 20-review, 5-ticket round and noted
@@ -1036,7 +1044,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.10.0";
+const APP_VERSION = "v3.11.0";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -2803,7 +2811,8 @@ function calibChipHTML(v, off){
     // Differs from the most common score = SOLID chip (border outlines break across lines in Word/LibreOffice)
     +";background:"+(off?st.fg:st.bg)+";color:"+(off?"#fff":st.fg)+";'"+(off?" title='Differs from the most common score'":"")+">"+txt+"</span>";
 }
-function calibReportHTML(insights, matrix){
+function calibReportHTML(insights, matrix, view){   // view: "category" (default) | "ticket" | "both" (export)
+  view = view || "category";
   var data = insights.data || {}, ai = insights.ai || {}, A = calibAnalyze(data, matrix);
   var aiCat = {}; (ai.categories||[]).forEach(function(c){ if(c && c.id) aiCat[c.id]=c; });
   var aiAud = {}; (ai.auditors||[]).forEach(function(a){ if(a && a.name) aiAud[calibName(a.name)]=a.note; });
@@ -2822,6 +2831,7 @@ function calibReportHTML(insights, matrix){
     + stat("Overall agreement", A.overall+"%", "reviews matching the most common score")
     + stat("Needs attention", (low+med)+" categor"+((low+med)===1?"y":"ies"), low+" low · "+med+" medium") + "</tr></table>";
   if(ai.summary) h += card("<p style='margin:0 0 4px;font-size:14px;font-weight:600;'>Summary</p><p style='margin:0;color:#374151;'>"+calibEsc(ai.summary)+"</p>");
+  if(view!=="ticket"){
   h += label("Category agreement — lowest first");
   var alignedList = [];
   A.cats.forEach(function(st){
@@ -2859,6 +2869,8 @@ function calibReportHTML(insights, matrix){
   });
   if(alignedList.length) h += card("<p style='margin:0 0 8px;font-size:12px;font-weight:600;color:#6b7280;'>Fully aligned — every auditor gave the same score on every ticket</p>"
     + alignedList.map(function(st){ return pill(calibEsc(st.cat.label)+(st.allNA?" · all N/A":""), "#e3f3ea", "#136c45"); }).join(" "));
+  }
+  if(view==="ticket"||view==="both") h += calibTicketSectionHTML(data, matrix, card, label, pill);
   h += "<p style='font-size:11.5px;color:#6b7280;margin:6px 0 0;'>"+["YES","PARTIAL","NO","NA"].map(function(l){ var s=CALIB_LVL_STYLE[l]; return "<span style='display:inline-block;width:11px;height:11px;border-radius:3px;background:"+s.bg+";vertical-align:-1px;'></span> "+(l==="NA"?"N/A":l); }).join("&nbsp;&nbsp; ")
     + "&nbsp;&nbsp; · <span style='display:inline-block;padding:0 6px;border-radius:4px;background:#8a5a12;color:#fff;font-weight:600;'>solid</span> = differs from the most common score · <b style='color:#a12a2a;'>Split</b> = no majority · Original = the audit's final score before this round (reference only) · <i>Original auditor</i> = not assigned their own ticket</p>";
   // Auditor tendencies (calculated position + AI note)
@@ -2888,6 +2900,80 @@ function calibReportHTML(insights, matrix){
 }
 
 // Prompt input: per category, the calculated stats + every reviewer's level and note (complete — no character cap)
+// v3.11.0: per-ticket analysis — one row per scored category, columns = the auditors who reviewed that ticket
+function calibAnalyzeTickets(data, matrix){
+  var reviews = data.reviews||{};
+  return (data.tickets||[]).map(function(t){
+    var rv = reviews[t.id]||{};
+    // same column order as the category view: participant order, then anyone else who reviewed it
+    var names = (data.participants||[]).filter(function(n){ return rv[n]; }).concat(Object.keys(rv).filter(function(n){ return (data.participants||[]).indexOf(n)<0; }));
+    var rows=[], naCats=0, agree=0, total=0;
+    matrix.forEach(function(c){
+      var levels = names.map(function(n){ return calibLvl((rv[n].scores||{})[c.id]); }).filter(Boolean);
+      if(!levels.length) return;
+      if(levels.every(function(l){ return l==="NA"; })){ naCats++; return; }
+      var counts={}; levels.forEach(function(l){ counts[l]=(counts[l]||0)+1; });
+      var top=Math.max.apply(null, Object.keys(counts).map(function(k){return counts[k];}));
+      var modes=Object.keys(counts).filter(function(k){ return counts[k]===top; });
+      agree+=top; total+=levels.length;
+      rows.push({cat:c, counts:counts, top:top, n:levels.length, mode: modes.length===1?modes[0]:null, tied: modes.length>1});
+    });
+    // each reviewer's total for the ticket, same rule as calcScore (N/A and blanks excluded from the max)
+    var totalOf = function(scores){ var p=0, m=0; matrix.forEach(function(c){ var v=(scores||{})[c.id]; if(!v||v==="NA") return; var x=calibPts(v); if(x!==null){ p+=x; m+=c.max; } }); return m ? Math.round(p/m*100) : null; };
+    var totals = {}; names.forEach(function(n){ totals[n] = totalOf(rv[n].scores); });
+    var splits = rows.filter(function(r){ return r.top<r.n; });
+    var pct = total ? Math.round(agree/total*100) : 100;
+    var vals = names.map(function(n){ return totals[n]; }).filter(function(v){ return v!==null; });
+    return {ticket:t, reviewers:names, rows:rows, naCats:naCats, pct:pct, tier: pct>=85?"high":pct>=70?"med":"low",
+            totals:totals, originalTotal: totalOf(t.original), spread: vals.length ? Math.max.apply(null,vals)-Math.min.apply(null,vals) : 0,
+            splits:splits, ties: rows.filter(function(r){ return r.tied; }).length,
+            flagged: names.filter(function(n){ return rv[n].autofail; })};
+  }).filter(function(x){ return x.reviewers.length; })
+    .sort(function(a,b){ return (a.pct-b.pct) || (b.ties-a.ties) || (b.spread-a.spread); });   // least agreement first
+}
+function calibTicketSectionHTML(data, matrix, card, label, pill){
+  var T = calibAnalyzeTickets(data, matrix), reviews = data.reviews||{};
+  var h = label("By ticket — least agreement first");
+  T.forEach(function(x){
+    var t=x.ticket, rv=reviews[t.id]||{}, TT=CALIB_TIER[x.tier];
+    var inner = "<table style='width:100%;border-collapse:collapse;'><tr><td style='vertical-align:middle;'><span style='font-size:15px;font-weight:600;color:#1565C0;'>#"+calibEsc(t.id)+"</span>"
+      + " <span style='color:#6b7280;'>· "+calibEsc(t.agent||"")+(t.contactReason?" · "+calibEsc(t.contactReason):"")+"</span>&nbsp;&nbsp;"+pill(TT.label,TT.bg,TT.fg)+"</td>"
+      + "<td style='text-align:right;white-space:nowrap;font-size:12px;color:#6b7280;vertical-align:middle;'>"
+      + "<span style='display:inline-block;width:110px;height:6px;border-radius:999px;background:#eef0f3;vertical-align:middle;'><span style='display:block;width:"+x.pct+"%;height:6px;border-radius:999px;background:"+TT.bar+";'></span></span>"
+      + "&nbsp;&nbsp;<b style='color:#1a1a2e;'>"+x.pct+"%</b> agreed</td></tr></table>";
+    var sub = [];
+    sub.push(x.splits.length ? ("Splits on: "+x.splits.map(function(r){ return r.cat.label+(r.tied?" (tie)":""); }).join(", ")) : "Every scored category agreed");
+    if(x.spread) sub.push("totals range "+x.spread+" pts");
+    if(t.originalReviewer) sub.push("original auditor: "+t.originalReviewer+" (not assigned)");
+    inner += "<p style='margin:4px 0 12px;color:#374151;'>"+calibEsc(sub.join(" · "))+"</p>";
+    var cols = x.reviewers, th = "font-weight:500;color:#6b7280;padding:2px 6px;white-space:nowrap;";
+    inner += "<div style='overflow-x:auto;'><table style='border-collapse:separate;border-spacing:4px;font-size:12px;margin:0 -4px 6px;'><tr><th style='text-align:left;"+th+"'>Category</th>"
+      + cols.map(function(n){ return "<th style='"+th+"'>"+calibEsc(n)+"</th>"; }).join("")
+      + "<th style='"+th+"border-left:1px dashed #d1d5db;'>Original</th><th style='"+th+"text-align:right;'>Agreed</th></tr>";
+    x.rows.forEach(function(r){
+      var split = Object.keys(r.counts).map(function(k){ return r.counts[k]; }).sort(function(a,b){return b-a;}).join("–");
+      inner += "<tr><td style='white-space:nowrap;padding-right:10px;color:#374151;'>"+calibEsc(r.cat.label)+"</td>"
+        + cols.map(function(n){ var v=(rv[n].scores||{})[r.cat.id]; return "<td style='text-align:center;padding:0;white-space:nowrap;'>"+calibChipHTML(v, !r.tied && r.mode && calibLvl(v)!==r.mode)+"</td>"; }).join("")
+        + "<td style='text-align:center;padding:0 0 0 4px;border-left:1px dashed #d1d5db;opacity:.8;white-space:nowrap;'>"+calibChipHTML((t.original||{})[r.cat.id], false)+"</td>"
+        + "<td style='text-align:right;white-space:nowrap;padding-left:8px;font-size:11.5px;color:"+(r.tied?"#a12a2a":"#6b7280")+";font-weight:"+(r.tied?600:400)+";'>"+(r.tied?"Split "+split:(r.top+" of "+r.n))+"</td></tr>";
+    });
+    // totals + autofail rows
+    var totCell = function(v){ return v===null ? "<span style='color:#c7cbd3;'>—</span>" : "<b style='font-weight:600;color:"+(v>=85?"#136c45":"#a12a2a")+";'>"+v+"%</b>"; };
+    inner += "<tr><td style='white-space:nowrap;padding:6px 10px 2px 0;border-top:1px solid #e5e7eb;font-weight:600;'>Total score</td>"
+      + cols.map(function(n){ return "<td style='text-align:center;padding:6px 0 2px;border-top:1px solid #e5e7eb;'>"+totCell(x.totals[n])+"</td>"; }).join("")
+      + "<td style='text-align:center;padding:6px 0 2px;border-top:1px solid #e5e7eb;border-left:1px dashed #d1d5db;opacity:.8;'>"+totCell(x.originalTotal)+"</td><td style='border-top:1px solid #e5e7eb;'></td></tr>";
+    inner += "<tr><td style='white-space:nowrap;padding:2px 10px 0 0;color:#374151;'>Autofail</td>"
+      + cols.map(function(n){ var f=!!(rv[n]||{}).autofail; return "<td style='text-align:center;padding:2px 0 0;font-size:11.5px;"+(f?"color:#a12a2a;font-weight:600;":"color:#9ca3af;")+"'"+(f&&(rv[n].autofailCondition)?" title='"+calibEsc(rv[n].autofailCondition)+"'":"")+">"+(f?"Flagged":"No")+"</td>"; }).join("")
+      + "<td style='text-align:center;padding:2px 0 0;font-size:11.5px;border-left:1px dashed #d1d5db;color:"+(t.originalAutofail?"#a12a2a":"#9ca3af")+";'>"+(t.originalAutofail?"Flagged":"No")+"</td>"
+      + "<td style='text-align:right;padding:2px 0 0 8px;font-size:11.5px;color:"+(x.flagged.length && x.flagged.length<cols.length?"#a12a2a":"#6b7280")+";font-weight:"+(x.flagged.length && x.flagged.length<cols.length?600:400)+";white-space:nowrap;'>"
+      + (x.flagged.length && x.flagged.length<cols.length ? "Split" : "Agreed") + "</td></tr>";
+    inner += "</table></div>";
+    if(x.naCats) inner += "<p style='margin:0;font-size:12px;color:#6b7280;'>+ "+x.naCats+" categor"+(x.naCats===1?"y":"ies")+" every reviewer marked N/A</p>";
+    h += card(inner);
+  });
+  return h;
+}
+
 function calibPromptPayload(data, matrix, A){
   var reviews = data.reviews||{};
   return {
@@ -3095,7 +3181,8 @@ function App() {
   const [savingAfDispute,setSavingAfDispute]=useState(false);
   const [calibPending,setCalibPending]=useState(0);
   const [afWindow,setAfWindow]=useState(null);   // v3.7.0 autofail dispute window (from /api/me)
-  const [duWindow,setDuWindow]=useState(null);   // v3.9.0 dispute unlock window — ALL disputes on locked audits in a range
+  const [duWindow,setDuWindow]=useState(null);
+  const [calibView,setCalibView]=useState("category");   // v3.11.0 Team Calibration report: "category" | "ticket"   // v3.9.0 dispute unlock window — ALL disputes on locked audits in a range
   const [manualLoaded,setManualLoaded]=useState(null);       // {ticket, warnings[], alreadyAudited, noTranscript}
   const [manualLoading,setManualLoading]=useState(false);
   const [manualAgentOverride,setManualAgentOverride]=useState(""); // only when Gorgias has no assignee
@@ -6813,7 +6900,7 @@ Rules:
         +"<p style='margin:0;font-size:12px;color:#6b7280;'>Wingman · Team Calibration Report</p>"
         +"<h1 style='margin:2px 0 4px;font-size:22px;font-weight:600;color:#1a1a2e;'>"+calibEsc(week)+"</h1>"
         +"<p style='margin:0 0 20px;font-size:13px;color:#6b7280;'>Agreement: <b style='color:#1a1a2e;'>"+calibEsc((data.summary||{}).agreementRating||"")+"</b></p>"
-        +calibReportHTML(data, matrix)+"</div></body></html>";
+        +calibReportHTML(data, matrix, "both")+"</div></body></html>";
     }
     var s=data.summary||{};
     var agreeColor=s.agreementRating==="Strong"?"#166534":s.agreementRating==="Moderate"?"#92400e":"#991b1b";
@@ -9965,7 +10052,13 @@ Rules:
                     <button onClick={function(){downloadTeamCalibDoc(teamCalibDetail.week, teamCalibDetail.insights);}} style={{...ghost,fontSize:"12px"}}>Export to Doc</button>
                   </div>
                   {teamCalibDetail.insights._v===2 ? (
-                    <div dangerouslySetInnerHTML={{__html: calibReportHTML(teamCalibDetail.insights, matrix)}}/>   /* v3.10.0: calculated report; all AI text is escaped */
+                    <div>
+                      {/* v3.11.0: By category / By ticket */}
+                      <div style={{display:"flex",gap:"18px",borderBottom:"1px solid var(--color-border-tertiary)",marginBottom:"16px"}}>
+                        {[["category","By category"],["ticket","By ticket"]].map(function(v){ return <button key={v[0]} onClick={function(){setCalibView(v[0]);}} style={tabStyle(calibView===v[0])}>{v[1]}</button>; })}
+                      </div>
+                      <div dangerouslySetInnerHTML={{__html: calibReportHTML(teamCalibDetail.insights, matrix, calibView)}}/>   {/* calculated report; all AI text is escaped */}
+                    </div>
                   ) : (<div>
                   <div style={{marginBottom:"14px"}}>
                     <span style={{fontSize:"11px",fontWeight:600,padding:"3px 10px",borderRadius:"10px",background:"var(--color-background-secondary)"}}>{teamCalibDetail.insights.summary&&teamCalibDetail.insights.summary.agreementRating} agreement</span>
