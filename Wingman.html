@@ -2,10 +2,23 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.14.0
-  Date:     2026-10-20
+  Version:  3.15.1
+  Date:     2026-11-05
 
   Changelog:
+  v3.15.1 (2026-11-05) -- FIX: the Gorgias ticket SUBJECT was never saved on audits created by AI Audit (batch), Manual Audit
+    or Delete & Replace (only Re-audit saved it), so tickets.subject was empty for most audits. All four paths save it now.
+    Existing audits keep an empty subject; identify them by transcript instead (e.g. Shopify alert text).
+
+  v3.15.0 (2026-10-20) -- AI CONNECTION CHECK
+    - Admin Tools > "AI connection" (Full only): the Anthropic key the server loaded (prefix + last 4 characters only;
+      the key never reaches the browser) and when the server started (a changed ANTHROPIC_KEY only takes effect after a
+      redeploy). "Test AI" makes one tiny call with the scoring model (Haiku) and the insights model (Sonnet) and reports
+      OK / No credits / Invalid key / Rate-limited / Overloaded / Unreachable, with the API's own message.
+    - Out-of-credits errors now read "AI credits have run out on the Anthropic account Wingman uses..." instead of the
+      raw API response, everywhere AI is used.
+    - Server: GET /api/admin/ai-status, POST /api/admin/ai-test (Full only); SERVER_STARTED_AT.
+
   v3.14.0 (2026-10-20) -- RE-AUDIT OVERRIDE (Full only)
     - When a re-audit finds no new messages, Full users get "Re-audit anyway" with a required reason. It re-fetches the
       conversation and re-scores like a normal re-audit. The reason, who and when are logged in the re-audit history
@@ -1079,7 +1092,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.14.0";
+const APP_VERSION = "v3.15.1";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -1142,6 +1155,11 @@ async function proxyFetch(targetUrl, method, headers, body) {
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
+    // v3.15.0: plain-English message when the Anthropic account is out of credits (the original audit is never changed)
+    if (/credit balance is too low/i.test(txt)) {
+      const e = new Error("AI credits have run out on the Anthropic account Wingman uses. A Full user can check Settings › Admin Tools › AI connection.");
+      e.code = "no_credits"; throw e;
+    }
     throw new Error("Request failed " + res.status + ": " + txt.slice(0, 200));
   }
   return res.json();
@@ -3064,6 +3082,53 @@ var BUILTIN_SCORING_RULES = [
   "Score based on what IS in the transcript.",
   "Only flag an autofail when you can point to a specific message that proves it."
 ];
+// ── AI CONNECTION (v3.15.0) — Admin Tools card, Full only ─────────────────────
+// Shows which Anthropic key the SERVER loaded (last 4 characters only — the key never reaches the browser) and when
+// the server started (a changed Railway variable only takes effect after a redeploy), plus a one-call test.
+function AiConnectionPanel({addToast}){
+  const [st,setSt]=useState(null);
+  const [res,setRes]=useState(null);
+  const [busy,setBusy]=useState(false);
+  useEffect(function(){ apiCall("/admin/ai-status").then(setSt).catch(function(e){ setSt({error:e.message}); }); }, []);
+  async function test(){
+    setBusy(true); setRes(null);
+    try {
+      var a = await apiCall("/admin/ai-test","POST",{model:"claude-haiku-4-5-20251001"});   // scoring model
+      var b = a.ok ? await apiCall("/admin/ai-test","POST",{model:"claude-sonnet-4-5"}) : null;   // insights model
+      setRes({scoring:a, insights:b}); setSt(function(s){ return Object.assign({}, s||{}, {key:a.key, serverStartedAt:a.serverStartedAt}); });
+    } catch(e){ setRes({scoring:{ok:false,status:"error",message:e.message}}); }
+    setBusy(false);
+  }
+  var k = st && st.key;
+  var row = function(label, r){ if(!r) return null; var c = r.ok ? {bg:"var(--color-background-success)",fg:"var(--color-text-success)",t:"OK"} : {bg:"var(--color-background-danger)",fg:"var(--color-text-danger)",t:({no_credits:"No credits",invalid_key:"Invalid key",no_key:"No key",rate_limited:"Rate-limited",overloaded:"Overloaded",network:"Unreachable"})[r.status]||"Error"};
+    return <div style={{display:"flex",gap:"10px",alignItems:"flex-start",padding:"8px 0",borderTop:"1px solid var(--color-border-tertiary)"}}>
+      <span style={{fontSize:"11px",fontWeight:600,padding:"2px 9px",borderRadius:"999px",background:c.bg,color:c.fg,whiteSpace:"nowrap"}}>{c.t}</span>
+      <div style={{fontSize:"13px"}}><strong>{label}</strong> — {r.message}{r.apiMessage&&<div style={{fontSize:"12px",color:"var(--color-text-secondary)",marginTop:"2px"}}>{r.apiMessage}</div>}</div></div>; };
+  return (
+    <div style={{border:"1px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:"12px",flexWrap:"wrap"}}>
+        <div>
+          <p style={{margin:"0 0 4px",fontSize:"13px",fontWeight:600}}>AI connection</p>
+          <p style={{margin:0,fontSize:"12px",color:"var(--color-text-secondary)",lineHeight:"1.55",maxWidth:"62ch"}}>
+            The Anthropic key the server is using right now. Compare the last 4 characters with your keys in the Anthropic Console (Settings › API Keys).
+            A changed <code>ANTHROPIC_KEY</code> on Railway only takes effect after a redeploy — check the start time below.
+          </p>
+        </div>
+        <button onClick={test} disabled={busy} style={{...btnInfo,opacity:busy?0.5:1}}>{busy?"Testing…":"Test AI"}</button>
+      </div>
+      {st&&st.error&&<p style={{fontSize:"12px",color:"var(--color-text-danger)",margin:"10px 0 0"}}>{st.error}</p>}
+      {k&&(
+        <div style={{display:"flex",gap:"24px",flexWrap:"wrap",margin:"12px 0 4px",fontSize:"13px"}}>
+          <div><div style={{fontSize:"12px",color:"var(--color-text-secondary)"}}>Key in use</div>
+            {k.configured ? <div><span style={{fontFamily:"var(--font-mono, monospace)"}}>{k.prefix||"sk-ant-…"}<strong>{k.last4}</strong></span></div> : <div style={{color:"var(--color-text-danger)"}}>Not set</div>}</div>
+          <div><div style={{fontSize:"12px",color:"var(--color-text-secondary)"}}>Server started</div><div>{st.serverStartedAt?new Date(st.serverStartedAt).toLocaleString():"—"}</div></div>
+        </div>
+      )}
+      {res&&(<div style={{marginTop:"8px"}}>{row("Scoring model (Haiku)", res.scoring)}{row("Insights model (Sonnet)", res.insights)}</div>)}
+    </div>
+  );
+}
+
 function allTrue(arr){ var o={}; arr.forEach(function(k){ o[k]=true; }); return o; }
 
 // Reusable checkbox multi-select dropdown for the Fetch tab. Driven by a {value:true} map;
@@ -3728,6 +3793,7 @@ function App() {
       agentName:     replacement.agent,
       ticketId:      String(replacement.id),
       ticketUrl:     replacement.ticketUrl,
+      subject:       replacement.subject||"",   // v3.15.1: subject was never saved on Delete & Replace audits
       createdDate:   replacement.created.slice(0,10),
       contactReason: parsed.meta&&parsed.meta.contactReason||replacement.crL1,
       product:       parsed.meta&&parsed.meta.product||"",
@@ -4149,7 +4215,7 @@ function App() {
         newResult={
           id:Date.now()+i,week:ticketWeekLabel(ticket.createdDate)||week,auditWeek:week,
           reviewer:ticket.reviewer||activeAuditor||"Batch QA",
-          agentName:ticket.agentName,ticketId:String(ticket.ticketId),ticketUrl:ticket.ticketUrl,
+          agentName:ticket.agentName,ticketId:String(ticket.ticketId),ticketUrl:ticket.ticketUrl,subject:ticket.subject||"", /* v3.15.1 */
           createdDate:ticket.createdDate||"",
           contactReason:parsed.meta?.contactReason||ticket.contactReason,
           product:parsed.meta?.product||"",ticketResolution:parsed.meta?.ticketResolution||"",
@@ -6572,7 +6638,7 @@ Rules:
       // Same shape as an AI Audit result (see runBatchQA) — only auditType differs
       var result = {
         week: ticketWeekLabel(ticket.createdDate)||week, auditWeek: week,
-        reviewer: currentUser.name, agentName: ticket.agentName, ticketId: String(ticket.ticketId), ticketUrl: ticket.ticketUrl,
+        reviewer: currentUser.name, agentName: ticket.agentName, ticketId: String(ticket.ticketId), ticketUrl: ticket.ticketUrl, subject: ticket.subject||"",   // v3.15.1
         createdDate: ticket.createdDate||"", contactReason: (parsed.meta&&parsed.meta.contactReason)||ticket.contactReason,
         product: (parsed.meta&&parsed.meta.product)||"", ticketResolution: (parsed.meta&&parsed.meta.ticketResolution)||"",
         scores: parsed.scores||{}, aiScores: parsed.scores||{}, autofails: parsed.autofails||[], autofailEvidence: parsed.autofailEvidence||[], autofail: hasAF,
@@ -10552,6 +10618,7 @@ Rules:
               {/* ── ADMIN TOOLS TAB (Full access only) ── */}
               {settingsTab==="admin"&&isFullAccess&&(
                 <div>
+                  <AiConnectionPanel addToast={addToast}/>
                   <DisputeWindowPanel kind="disputes" addToast={addToast} value={duWindow} onChange={setDuWindow}/>
                   <AutofailWindowPanel addToast={addToast} value={afWindow} onChange={setAfWindow}/>
                   {/* One-time fix launcher (v3.8.0): audits scored on a cut-off transcript */}
