@@ -2,10 +2,24 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.16.0
-  Date:     2026-11-05
+  Version:  3.17.0
+  Date:     2026-11-09
 
   Changelog:
+  v3.17.0 (2026-11-09) -- RECHARGE: SUBSCRIPTION FACTS FOR SCORING
+    - Tickets whose Contact Reason is in a configurable list (Admin Tools > Recharge; default Cancel::Subscription (Aware)
+      and (Unaware)) get a read-only Recharge lookup by the ticket's customer email before scoring: subscriptions (status,
+      cancelled_at, cancellation reason, next charge, frequency, product) and charges from 30 days before the ticket on.
+      The AI receives them as a "RECHARGE DATA" facts block before the transcript; how to score with them lives in the matrix
+      Scoring context (nothing about scoring is hard-coded). Applies on all five scoring paths (AI Audit, Manual, Re-audit,
+      Delete & Replace, re-score). A failed lookup sends nothing and is recorded on the audit.
+    - Saved with the audit (ai_meta.recharge) and shown in Review as "Recharge at scoring time" for auditors and disputes.
+    - Admin Tools > Recharge (Full only): key in use (last 4), Test Recharge, and the Contact Reason list (config
+      "rechargeContactReasons").
+    - FIX: a just-saved Manual Audit showed its AI score as "Fail" until reload (pass flag passed under the wrong name).
+    - Server: POST /api/recharge/lookup (Edit+; RECHARGE_KEY stays server-side; returns no name / email / address),
+      GET /api/admin/recharge-status (Full). Recharge API version 2021-11.
+
   v3.16.0 (2026-11-05) -- BATCH FETCH SQL: SKIP TICKETS WITH NO CUSTOMER MESSAGE; BOTS NEVER COUNT AS REPLIES
     - per_ticket now has HAVING COUNTIF(m.from_agent = FALSE) > 0: tickets where the customer never wrote are skipped
       (agent-initiated check-ins closed by the no-response rule, e.g. #470293518; bare "Shopify Alert Delivery Failed"
@@ -1101,7 +1115,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.16.0";
+const APP_VERSION = "v3.17.0";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -1368,8 +1382,8 @@ async function saveTicketToDb(ticket) {
     maxPoints:         ticket.maxPoints==null?null:ticket.maxPoints,
     replacedFor:       ticket.replacedFor||"",
     customerEmail:     ticket.customerEmail||"",
-    aiMeta:            (ticket.product||ticket.ticketResolution||(ticket.autofailEvidence||[]).length) ? {product:ticket.product||"", ticketResolution:ticket.ticketResolution||"",
-                        autofailEvidence: ticket.autofailEvidence||[]} : null,   // v3.12.0: why the AI flagged an autofail
+    aiMeta:            (ticket.product||ticket.ticketResolution||(ticket.autofailEvidence||[]).length||RECHARGE_BY_TICKET[String(ticket.ticketId)]) ? {product:ticket.product||"", ticketResolution:ticket.ticketResolution||"",
+                        autofailEvidence: ticket.autofailEvidence||[], recharge: RECHARGE_BY_TICKET[String(ticket.ticketId)]||undefined} : null,   // v3.12.0: why the AI flagged an autofail
     ctfAsScored:       ticket.ctfAsScored||null,
     matrixVersion:     CURRENT_MATRIX_VERSION,
   };
@@ -1500,8 +1514,9 @@ function parseTicketRow(r) {
     replacedFor: r.replacedFor || "",
     customerEmail: r.customerEmail || "",
     // v3.12.0: a just-scored result carries product / ticketResolution / autofailEvidence at the top level
-    aiMeta: r.aiMeta || ((r.product||r.ticketResolution||(r.autofailEvidence||[]).length)
-            ? {product:r.product||"", ticketResolution:r.ticketResolution||"", autofailEvidence:r.autofailEvidence||[]} : null),
+    aiMeta: r.aiMeta || ((r.product||r.ticketResolution||(r.autofailEvidence||[]).length||RECHARGE_BY_TICKET[String(r.ticketId)])
+            ? {product:r.product||"", ticketResolution:r.ticketResolution||"", autofailEvidence:r.autofailEvidence||[],
+               recharge: RECHARGE_BY_TICKET[String(r.ticketId)]||undefined} : null),
     ctfAsScored: r.ctfAsScored || null,
     matrixVersion: r.matrixVersion==null ? null : r.matrixVersion,
     snapshotStatus: r.snapshotStatus || "none",
@@ -3075,7 +3090,7 @@ function normalizeAutofailEvidence(ev, autofails){
 // v3.12.0: results added straight to state (AI Audit, Delete & Replace) need aiMeta for Review's autofail evidence
 function withAiMeta(r){
   if(!r || r.aiMeta) return r;
-  if(r.product||r.ticketResolution||(r.autofailEvidence||[]).length) r.aiMeta = {product:r.product||"", ticketResolution:r.ticketResolution||"", autofailEvidence:r.autofailEvidence||[]};
+  if(r.product||r.ticketResolution||(r.autofailEvidence||[]).length||RECHARGE_BY_TICKET[String(r.ticketId)]) r.aiMeta = {product:r.product||"", ticketResolution:r.ticketResolution||"", autofailEvidence:r.autofailEvidence||[], recharge:RECHARGE_BY_TICKET[String(r.ticketId)]||undefined};
   return r;
 }
 // v3.13.0: scoring POLICY that used to be hard-coded in the prompt. Sent by code only until a Full user moves it into
@@ -3134,6 +3149,76 @@ function AiConnectionPanel({addToast}){
         </div>
       )}
       {res&&(<div style={{marginTop:"8px"}}>{row("Scoring model (Haiku)", res.scoring)}{row("Insights model (Sonnet)", res.insights)}</div>)}
+    </div>
+  );
+}
+
+// ── RECHARGE (v3.17.0) ────────────────────────────────────────────────────────
+// For tickets whose Contact Reason is in the configurable list (Admin Tools > Recharge; default: subscription
+// cancellations), Wingman looks the customer up in Recharge (server-side, read-only) and gives the AI the FACTS:
+// subscriptions + recent charges. How to score with them lives in the matrix Scoring context, not here.
+var DEFAULT_RECHARGE_REASONS = ["Cancel::Subscription (Aware)", "Cancel::Subscription (Unaware)"];
+var RECHARGE_BY_TICKET = {};   // ticketId -> lookup result from the last scoring run (saved into ai_meta.recharge)
+function normCR(v){ return String(v||"").split("::").map(function(x){ return x.trim().toLowerCase(); }).filter(Boolean).join("::"); }
+function ticketContactReason(t){
+  return (t.contactReasonL1 && t.contactReasonL2 && t.contactReasonL2!=="N/A") ? t.contactReasonL1+"::"+t.contactReasonL2 : (t.contactReason||t.contactReasonL1||"");
+}
+function rechargePromptBlock(rd){
+  if(!rd) return "";
+  if(!rd.ok) return "";   // lookup failed: nothing is sent (recorded on the audit instead)
+  var h = "RECHARGE DATA (subscription system of record; fetched "+rd.fetchedAt+"; all times UTC):\n";
+  if(!rd.found) return h + "  No Recharge customer found for this ticket's customer email.\n\n";
+  (rd.subscriptions||[]).forEach(function(s){
+    h += "  Subscription "+s.id+": "+(s.product_title||"")+(s.variant_title?" ("+s.variant_title+")":"")+" — status "+s.status
+      + "; created "+(s.created_at||"?")+(s.cancelled_at?"; cancelled "+s.cancelled_at:"")
+      + (s.cancellation_reason?"; cancellation reason \""+s.cancellation_reason+"\"":"")+(s.cancellation_reason_comments?" ("+s.cancellation_reason_comments+")":"")
+      + (s.next_charge_scheduled_at?"; next charge "+s.next_charge_scheduled_at:"")
+      + (s.order_interval_frequency?"; every "+s.order_interval_frequency+" "+(s.order_interval_unit||""):"")
+      + "; last updated "+(s.updated_at||"?")+"\n";
+  });
+  (rd.charges||[]).forEach(function(c){
+    h += "  Charge "+c.id+": status "+c.status+(c.scheduled_at?"; scheduled "+c.scheduled_at:"")+(c.processed_at?"; processed "+c.processed_at:"")
+      + (c.total_price!=null?"; total "+c.total_price:"")+"; last updated "+(c.updated_at||"?")+"\n";
+  });
+  if(!(rd.subscriptions||[]).length && !(rd.charges||[]).length) h += "  Customer found, but no subscriptions or recent charges.\n";
+  return h + "\n";
+}
+// Admin Tools card: connection status/test + which Contact Reasons trigger a lookup (saved to config, Full only)
+function RechargePanel({addToast, reasons, setReasons, crChoices, saveConfig}){
+  const [st,setSt]=useState(null);
+  const [busy,setBusy]=useState(false);
+  const [draft,setDraft]=useState(reasons);
+  useEffect(function(){ setDraft(reasons); }, [JSON.stringify(reasons)]);
+  useEffect(function(){ apiCall("/admin/recharge-status").then(setSt).catch(function(e){ setSt({error:e.message}); }); }, []);
+  async function test(){ setBusy(true); try { setSt(await apiCall("/admin/recharge-status?test=1")); } catch(e){ setSt({error:e.message}); } setBusy(false); }
+  async function save(){ try { await saveConfig("rechargeContactReasons", draft); setReasons(draft); addToast("Recharge contact reasons saved"); } catch(e){ addToast(e.message,"error"); } }
+  var dirty = JSON.stringify(draft)!==JSON.stringify(reasons);
+  var all = (crChoices||[]).map(function(c){ var p=c.split("::"); return p.map(function(x){return x.trim();}).join("::"); });
+  draft.forEach(function(d){ if(all.indexOf(d)<0) all.push(d); });
+  all = all.filter(function(c){ return /^cancel|^subscription/i.test(c) || draft.indexOf(c)>=0; });
+  return (
+    <div style={{border:"1px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-lg)",padding:"16px",marginBottom:"20px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:"12px",flexWrap:"wrap"}}>
+        <div>
+          <p style={{margin:"0 0 4px",fontSize:"13px",fontWeight:600}}>Recharge</p>
+          <p style={{margin:0,fontSize:"12px",color:"var(--color-text-secondary)",lineHeight:"1.55",maxWidth:"62ch"}}>
+            For tickets with the Contact Reasons below, Wingman looks the customer up in Recharge (read-only) and gives the AI their
+            subscriptions and recent charges, so it can check what the agent says was done. How to score with it belongs in the matrix Scoring context.
+          </p>
+        </div>
+        <button onClick={test} disabled={busy||!(st&&st.configured)} style={{...ghost,opacity:(busy||!(st&&st.configured))?0.5:1}}>{busy?"Testing…":"Test Recharge"}</button>
+      </div>
+      {st&&(<div style={{margin:"10px 0",fontSize:"13px"}}>
+        {st.error ? <span style={{color:"var(--color-text-danger)"}}>{st.error}</span>
+          : !st.configured ? <span style={{color:"var(--color-text-danger)"}}>RECHARGE_KEY is not set on the server.</span>
+          : <span>Key in use: <strong style={{fontFamily:"monospace"}}>…{st.last4}</strong> · API {st.apiVersion}{st.message?<span style={{color:st.ok?"var(--color-text-success)":"var(--color-text-danger)"}}> · {st.message}</span>:null}</span>}
+      </div>)}
+      <label style={lbl}>Contact Reasons that trigger a Recharge lookup</label>
+      <div style={{display:"flex",flexWrap:"wrap",gap:"6px 14px",marginBottom:"10px"}}>
+        {all.map(function(c){ var on=draft.indexOf(c)>=0; return <label key={c} style={{display:"flex",gap:"6px",alignItems:"center",fontSize:"13px",cursor:"pointer"}}>
+          <input type="checkbox" checked={on} onChange={function(){ setDraft(on?draft.filter(function(x){return x!==c;}):draft.concat([c])); }}/>{c}</label>; })}
+      </div>
+      <button onClick={save} disabled={!dirty} style={{...btnInfo,opacity:dirty?1:0.5}}>Save</button>
     </div>
   );
 }
@@ -3328,7 +3413,8 @@ function App() {
   const [afWindow,setAfWindow]=useState(null);   // v3.7.0 autofail dispute window (from /api/me)
   const [duWindow,setDuWindow]=useState(null);
   const [reauditOverrideReason,setReauditOverrideReason]=useState("");   // v3.14.0
-  const [rulesMigrated,setRulesMigrated]=useState(false);   // v3.13.0: built-in policy moved into the Scoring context?
+  const [rulesMigrated,setRulesMigrated]=useState(false);
+  const [rechargeReasons,setRechargeReasons]=useState(DEFAULT_RECHARGE_REASONS);   // v3.17.0   // v3.13.0: built-in policy moved into the Scoring context?
   const [migratingRules,setMigratingRules]=useState(false);
   const [calibView,setCalibView]=useState("category");   // v3.11.0 Team Calibration report: "category" | "ticket"   // v3.9.0 dispute unlock window — ALL disputes on locked audits in a range
   const [manualLoaded,setManualLoaded]=useState(null);       // {ticket, warnings[], alreadyAudited, noTranscript}
@@ -3783,7 +3869,7 @@ function App() {
     };
 
     // Score via Claude Haiku (same as batch QA)
-    var rawTxt = await callClaudeWithRetry(buildEvalPrompt(ticketObj));
+    var rawTxt = await callClaudeWithRetry(buildEvalPrompt(await withRecharge(ticketObj)));
     console.log("[Replace][3] Claude response received");
     var cleanTxt = rawTxt.replace(/```(?:json)?\s*/g,"").replace(/```/g,"").trim();
     var jsonMatch = cleanTxt.match(/\{[\s\S]+\}/);
@@ -3906,7 +3992,7 @@ function App() {
           customerEmail: rm.ticket.customerEmail||"",
           reviewer:      rm.ticket.reviewer,
         }, raTags);
-        var rawTxt = await callClaudeWithRetry(buildEvalPrompt(ticketObj));
+        var rawTxt = await callClaudeWithRetry(buildEvalPrompt(await withRecharge(ticketObj)));
         console.log("[Reaudit][2] Claude response received");
         var cleanTxt = rawTxt.replace(/```(?:json)?\s*/g,"").replace(/```/g,"").trim();
         var jsonMatch = cleanTxt.match(/\{[\s\S]+\}/);
@@ -4166,6 +4252,7 @@ function App() {
       +"  Product: "+((ticket.productL1&&ticket.productL2&&ticket.productL2!=="N/A")?ticket.productL1+"::"+ticket.productL2:ticket.productL1||"not tagged")+"\n"
       +"  Ticket Resolution: "+((ticket.resolutionL1&&ticket.resolutionL2&&ticket.resolutionL2!=="N/A")?ticket.resolutionL1+"::"+ticket.resolutionL2:ticket.resolutionL1||"not tagged")+"\n"
       +"  Additional Resolution: "+((ticket.addResolutionL1&&ticket.addResolutionL2&&ticket.addResolutionL2!=="N/A")?ticket.addResolutionL1+"::"+ticket.addResolutionL2:ticket.addResolutionL1||"not tagged")+"\n\n"
+      +rechargePromptBlock(ticket.rechargeData||RECHARGE_BY_TICKET[String(ticket.ticketId)])   // v3.17.0: facts only
       +"TRANSCRIPT:\n"+cleanTranscript+"\n\n"
       +'Respond ONLY with JSON: {"meta":{"contactReason":"...","product":"...","ticketResolution":"...","returnOrRefund":"..."},'
       +'"scores":{'+scoresSchema+'},'
@@ -4212,7 +4299,7 @@ function App() {
       }
       var newResult=null;
       try {
-        var rawTxt=await callClaudeWithRetry(buildEvalPrompt(ticket));
+        var rawTxt=await callClaudeWithRetry(buildEvalPrompt(await withRecharge(ticket)));
         var cleanTxt=rawTxt.replace(/```(?:json)?\s*/g,"").replace(/```/g,"").trim();
         var jsonMatch=cleanTxt.match(/\{[\s\S]+\}/);
         if(!jsonMatch)throw new Error("No JSON in response");
@@ -5596,7 +5683,7 @@ Rules:
         var ticketObj = Object.assign({}, t, tags, {transcript: scoringTranscript}, {
           contactReason: (tags.contactReasonL1&&tags.contactReasonL2&&tags.contactReasonL2!=="N/A") ? tags.contactReasonL1+"::"+tags.contactReasonL2 : (tags.contactReasonL1||t.contactReason)
         });
-        var rawTxt = await callClaudeWithRetry(buildEvalPrompt(ticketObj));
+        var rawTxt = await callClaudeWithRetry(buildEvalPrompt(await withRecharge(ticketObj)));
         var cleanTxt = rawTxt.replace(/```(?:json)?\s*/g,"").replace(/```/g,"").trim();
         var jm = cleanTxt.match(/\{[\s\S]+\}/);
         if(!jm){ out.errors.push({t:t, why:"No JSON in AI response"}); continue; }
@@ -5675,7 +5762,8 @@ Rules:
           aiPassed: !it.autofail && it.newPct>=85, finalPassed: it.newPassed,
           autofail: it.autofail, justifications: justif, reauditHistory: hist,
           totalPoints: it.sc?it.sc.pts:0, maxPoints: it.sc?it.sc.max:0, matrixVersion: matrixVersion,
-          aiMeta: {product:(p.meta&&p.meta.product)||"", ticketResolution:(p.meta&&p.meta.ticketResolution)||"", autofailEvidence: p.autofailEvidence||[]}
+          aiMeta: {product:(p.meta&&p.meta.product)||"", ticketResolution:(p.meta&&p.meta.ticketResolution)||"", autofailEvidence: p.autofailEvidence||[],
+                   recharge: RECHARGE_BY_TICKET[String(t.ticketId)]||(t.aiMeta&&t.aiMeta.recharge)||undefined}
         };
         if(!t.autofailManual) patch.autofails = p.autofails||[];
         if(!keepComments && p.comments) patch.comments = p.comments;
@@ -6647,7 +6735,7 @@ Rules:
     if(manualLoaded.alreadyAudited && !window.confirm("Ticket #"+ticket.ticketId+" was already audited. Add another audit?")) return;
     setManualRunning(true); setManualResult(null); setManualStatus("Scoring with AI (same rubric as "+UI_LABELS.batch+")…");
     try {
-      var rawTxt = await callClaudeWithRetry(buildEvalPrompt(ticket));
+      var rawTxt = await callClaudeWithRetry(buildEvalPrompt(await withRecharge(ticket)));
       var cleanTxt = rawTxt.replace(/```(?:json)?\s*/g,"").replace(/```/g,"").trim();
       var jsonMatch = cleanTxt.match(/\{[\s\S]+\}/);
       if(!jsonMatch) throw new Error("AI scoring failed — no JSON in response");
@@ -6677,7 +6765,7 @@ Rules:
       // "Condition: —" and "rubric 0%" in Review until a reload
       setTickets(function(ts){ return [parseTicketRow(Object.assign({pageId:saved.id}, result, {
         scoresJSON: JSON.stringify(result.aiScores||result.scores||{}), justificationsJSON: JSON.stringify(result.justifications||{}),
-        autofailsJSON: JSON.stringify(result.autofails||[]), disputesJSON: "{}" }))].concat(ts); });
+        autofailsJSON: JSON.stringify(result.autofails||[]), disputesJSON: "{}", aiPassed: result.passed }))].concat(ts); });   // v3.17.0: AI pass flag (was shown as Fail until reload)
       setManualResult(result);
       addToast("Manual audit saved — "+result.aiScore+"%");
     } catch(e){ addToast("Error: "+e.message,"error"); }
@@ -7197,6 +7285,8 @@ Rules:
       if(savedMatrix && Array.isArray(savedMatrix)) { setMatrix(savedMatrix); setMatrixVersion(CURRENT_MATRIX_VERSION); }
       var savedAutofails = await loadConfigFromDb("autofails");
       if(savedAutofails && Array.isArray(savedAutofails)) setAutofailList(savedAutofails);
+      var savedRechargeReasons = await loadConfigFromDb("rechargeContactReasons");   // v3.17.0
+      if(Array.isArray(savedRechargeReasons)) setRechargeReasons(savedRechargeReasons);
       var savedRulesMigrated = await loadConfigFromDb("rulesMigrated");   // v3.13.0
       setRulesMigrated(savedRulesMigrated===true);
       var savedScoringContext = await loadConfigFromDb("scoringContext");
@@ -7254,6 +7344,21 @@ Rules:
       addToast("Built-in rules moved to the Scoring context");
     } catch(e){ addToast("Move failed: "+e.message,"error"); }
     setMigratingRules(false);
+  }
+
+  // v3.17.0: attach Recharge facts when the ticket's Contact Reason is in the configured list. Never throws.
+  async function withRecharge(t){
+    try {
+      if(!t) return t;
+      var cr = normCR(ticketContactReason(t));
+      var want = (rechargeReasons||[]).map(normCR);
+      if(!cr || want.indexOf(cr)<0) return t;
+      var since = String(t.createdDate||"").slice(0,10);
+      if(since){ var d=new Date(since+"T00:00:00Z"); d.setUTCDate(d.getUTCDate()-30); since=d.toISOString().slice(0,10); }
+      var rd = await apiCall("/recharge/lookup","POST",{email:t.customerEmail||"", since:since});
+      RECHARGE_BY_TICKET[String(t.ticketId)] = rd; t.rechargeData = rd;
+    } catch(e){ RECHARGE_BY_TICKET[String(t&&t.ticketId)] = {ok:false, error:e.message, fetchedAt:new Date().toISOString()}; }
+    return t;
   }
 
   async function saveMatrix() {
@@ -8242,6 +8347,37 @@ Rules:
                 );
               })()}
 
+              {/* v3.17.0: what Recharge showed when this audit was scored */}
+              {reviewSelected.aiMeta&&reviewSelected.aiMeta.recharge&&(function(){
+                var rd = reviewSelected.aiMeta.recharge;
+                var cell = {padding:"6px 10px",borderBottom:"1px solid #f0f1f4",fontSize:"12.5px",verticalAlign:"top"};
+                var th = {padding:"6px 10px",fontSize:"12px",fontWeight:500,color:"var(--color-text-secondary)",textAlign:"left",borderBottom:"1px solid var(--color-border-tertiary)"};
+                var when = function(v){ return v ? String(v).replace("T"," ").slice(0,16) : "—"; };
+                return (
+                  <div style={card}>
+                    <p style={{margin:0,fontSize:"14px",fontWeight:600}}>Recharge at scoring time</p>
+                    <p style={{margin:"2px 0 12px",fontSize:"12px",color:"var(--color-text-secondary)"}}>Fetched {when(rd.fetchedAt)} UTC · what the AI was given to check subscription actions</p>
+                    {!rd.ok ? <p style={{margin:0,fontSize:"13px",color:"var(--color-text-warning)"}}>Lookup failed, so no Recharge data was used: {rd.error||"unknown error"}</p>
+                    : !rd.found ? <p style={{margin:0,fontSize:"13px"}}>No Recharge customer found for this ticket's customer email.</p>
+                    : (<div style={{overflowX:"auto"}}>
+                        {(rd.subscriptions||[]).length>0&&(<table style={{width:"100%",borderCollapse:"collapse",marginBottom:"10px"}}>
+                          <thead><tr>{["Subscription","Product","Status","Cancelled","Reason","Next charge","Frequency"].map(function(h){ return <th key={h} style={th}>{h}</th>; })}</tr></thead>
+                          <tbody>{rd.subscriptions.map(function(s){ return <tr key={s.id}>
+                            <td style={cell}>{s.id}</td><td style={cell}>{s.product_title}{s.variant_title?" · "+s.variant_title:""}</td>
+                            <td style={{...cell,fontWeight:600,color:String(s.status).toLowerCase()==="cancelled"?"var(--color-text-danger)":"var(--color-text-success)"}}>{s.status}</td>
+                            <td style={cell}>{when(s.cancelled_at)}</td><td style={cell}>{[s.cancellation_reason,s.cancellation_reason_comments].filter(Boolean).join(" — ")||"—"}</td>
+                            <td style={cell}>{when(s.next_charge_scheduled_at)}</td><td style={cell}>{s.order_interval_frequency?("every "+s.order_interval_frequency+" "+(s.order_interval_unit||"")):"—"}</td>
+                          </tr>; })}</tbody></table>)}
+                        {(rd.charges||[]).length>0&&(<table style={{width:"100%",borderCollapse:"collapse"}}>
+                          <thead><tr>{["Charge","Status","Scheduled","Processed","Total"].map(function(h){ return <th key={h} style={th}>{h}</th>; })}</tr></thead>
+                          <tbody>{rd.charges.map(function(c){ return <tr key={c.id}>
+                            <td style={cell}>{c.id}</td><td style={{...cell,fontWeight:600}}>{c.status}</td><td style={cell}>{when(c.scheduled_at)}</td><td style={cell}>{when(c.processed_at)}</td><td style={cell}>{c.total_price!=null?c.total_price:"—"}</td>
+                          </tr>; })}</tbody></table>)}
+                        {!(rd.subscriptions||[]).length&&!(rd.charges||[]).length&&<p style={{margin:0,fontSize:"13px"}}>Customer found, but no subscriptions or recent charges.</p>}
+                      </div>)}
+                  </div>
+                );
+              })()}
               {/* Category scores */}
               <div style={card}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"12px"}}>
@@ -10640,6 +10776,7 @@ Rules:
               {settingsTab==="admin"&&isFullAccess&&(
                 <div>
                   <AiConnectionPanel addToast={addToast}/>
+                  <RechargePanel addToast={addToast} reasons={rechargeReasons} setReasons={setRechargeReasons} crChoices={ctfFieldOpts.fields.contactReason} saveConfig={saveConfigToDb}/>
                   <DisputeWindowPanel kind="disputes" addToast={addToast} value={duWindow} onChange={setDuWindow}/>
                   <AutofailWindowPanel addToast={addToast} value={afWindow} onChange={setAfWindow}/>
                   {/* One-time fix launcher (v3.8.0): audits scored on a cut-off transcript */}

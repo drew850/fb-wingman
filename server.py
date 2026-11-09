@@ -1,4 +1,4 @@
-# Wingman server — v3.9.0
+# Wingman server — v3.17.0
 # Storage: Postgres (DATABASE_URL). Notion is used ONLY by the one-time import + verify
 # jobs under /api/admin/*, server-side, and is never proxied for the browser.
 import os, json, re, urllib.request, urllib.error, secrets, hashlib, time, threading, queue, base64, traceback, uuid
@@ -16,13 +16,17 @@ except Exception as _imp_err:  # server still boots and reports the problem on /
     psycopg = None
     _PSYCOPG_IMPORT_ERROR = str(_imp_err)
 
-SERVER_VERSION      = "3.9.0"
+SERVER_VERSION      = "3.17.0"
 HTML_FILE           = "Wingman.html"
 PORT                = int(os.environ.get("PORT", 3747))
 DIR                 = os.path.dirname(os.path.abspath(__file__))
 DATABASE_URL        = os.environ.get("DATABASE_URL", "")
 NOTION_TOKEN        = os.environ.get("NOTION_TOKEN", "")   # import/verify only; unset after cutover
 ANTHROPIC_KEY       = os.environ.get("ANTHROPIC_KEY", "")
+RECHARGE_KEY        = os.environ.get("RECHARGE_KEY", "")          # v3.17.0: read-only Recharge Admin API token
+RECHARGE_API        = "https://api.rechargeapps.com"
+RECHARGE_VERSION    = "2021-11"
+SERVER_STARTED_AT   = datetime.now(timezone.utc).isoformat()   # v3.15.0: shown in Admin Tools > AI connection
 GOOGLE_CLIENT_ID    = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET= os.environ.get("GOOGLE_CLIENT_SECRET", "")
 BASE_URL            = os.environ.get("BASE_URL", "https://vigilant-youthfulness-production-896b.up.railway.app")
@@ -2075,6 +2079,106 @@ def api_insight_delete(h, user, pp, qs, body):
     db_exec("DELETE FROM insights WHERE id=%s", (pp["id"],))
     return {"ok": True}
 
+# ── AI connection check (v3.15.0) — Full only. Never returns the key itself. ───────
+def _key_hint():
+    k = ANTHROPIC_KEY.strip()
+    if not k: return {"configured": False}
+    return {"configured": True, "last4": k[-4:], "prefix": k[:10] + "…" if len(k) > 14 else "", "length": len(k)}
+
+def api_ai_status(h, user, pp, qs, body):
+    return {"key": _key_hint(), "serverStartedAt": SERVER_STARTED_AT, "serverVersion": SERVER_VERSION}
+
+def api_ai_test(h, user, pp, qs, body):
+    out = {"key": _key_hint(), "serverStartedAt": SERVER_STARTED_AT, "testedAt": now_iso()}
+    if not ANTHROPIC_KEY:
+        return dict(out, ok=False, status="no_key", message="ANTHROPIC_KEY is not set on the server.")
+    payload = json.dumps({"model": c_text(body.get("model")) or "claude-haiku-4-5", "max_tokens": 5,
+                          "messages": [{"role": "user", "content": "Reply with OK"}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=payload, method="POST",
+                                 headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"})
+    try:
+        resp = urllib.request.urlopen(req, timeout=30); d = json.loads(resp.read() or b"{}")
+        return dict(out, ok=True, status="ok", model=d.get("model", ""), message="The key works and the account has credits.")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try: err = (json.loads(raw).get("error") or {})
+        except Exception: err = {}
+        msg = err.get("message") or raw[:300]
+        low = msg.lower()
+        status = ("no_credits" if "credit balance" in low else "invalid_key" if e.code == 401 or "x-api-key" in low or "authentication" in low
+                  else "rate_limited" if e.code == 429 else "overloaded" if e.code == 529 else "error")
+        plain = {"no_credits": "The key works, but its Anthropic organization has no credits.",
+                 "invalid_key": "The key was rejected (invalid or revoked).",
+                 "rate_limited": "Rate-limited right now — the key itself is fine.",
+                 "overloaded": "Anthropic is overloaded right now — try again shortly."}.get(status, "The API returned an error.")
+        return dict(out, ok=False, status=status, httpStatus=e.code, message=plain, apiMessage=msg)
+    except Exception as e:
+        return dict(out, ok=False, status="network", message="Couldn't reach the Anthropic API: " + str(e)[:200])
+
+# ── Recharge (v3.17.0) — read-only subscription facts for scoring. Key never leaves the server; no PII returned. ──
+def recharge_get(path, params=None, tries=3):
+    q = ("?" + urlencode(params)) if params else ""
+    req = urllib.request.Request(RECHARGE_API + path + q, method="GET", headers={
+        "X-Recharge-Access-Token": RECHARGE_KEY, "X-Recharge-Version": RECHARGE_VERSION, "Accept": "application/json"})
+    for attempt in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < tries - 1:
+                time.sleep(float(e.headers.get("Retry-After") or 2)); continue
+            raise
+
+_SUB_FIELDS = ("id", "status", "product_title", "variant_title", "quantity", "created_at", "updated_at", "cancelled_at",
+               "cancellation_reason", "cancellation_reason_comments", "next_charge_scheduled_at",
+               "order_interval_frequency", "order_interval_unit")
+_CHARGE_FIELDS = ("id", "status", "scheduled_at", "processed_at", "updated_at", "total_price")
+
+def api_recharge_lookup(h, user, pp, qs, body):
+    """Facts only: the customer's subscriptions and recent charges, matched by the ticket's customer email."""
+    out = {"fetchedAt": now_iso(), "configured": bool(RECHARGE_KEY)}
+    if not RECHARGE_KEY:
+        return dict(out, ok=False, error="RECHARGE_KEY is not set on the server")
+    email = c_text(body.get("email")).strip().lower()
+    since = c_text(body.get("since")).strip()[:10]
+    if not email or "@" not in email:
+        return dict(out, ok=False, error="ticket has no customer email")
+    try:
+        custs = (recharge_get("/customers", {"email": email}) or {}).get("customers") or []
+        if not custs:
+            return dict(out, ok=True, found=False)
+        subs, charges = [], []
+        for c in custs[:3]:
+            cid = c.get("id")
+            for sb in (recharge_get("/subscriptions", {"customer_id": cid, "limit": 250}) or {}).get("subscriptions") or []:
+                subs.append({k: sb.get(k) for k in _SUB_FIELDS})
+            for ch in (recharge_get("/charges", {"customer_id": cid, "limit": 250}) or {}).get("charges") or []:
+                d = (ch.get("scheduled_at") or ch.get("processed_at") or ch.get("updated_at") or "")[:10]
+                if not since or not d or d >= since:
+                    charges.append({k: ch.get(k) for k in _CHARGE_FIELDS})
+        charges.sort(key=lambda x: (x.get("scheduled_at") or x.get("processed_at") or ""), reverse=True)
+        return dict(out, ok=True, found=True, customers=len(custs), subscriptions=subs, charges=charges[:25])
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode("utf-8", "replace")[:300]
+        return dict(out, ok=False, error=f"Recharge API {e.code}: {msg}")
+    except Exception as e:
+        return dict(out, ok=False, error="Recharge unreachable: " + str(e)[:200])
+
+def api_recharge_status(h, user, pp, qs, body):
+    k = RECHARGE_KEY.strip()
+    out = {"configured": bool(k), "last4": k[-4:] if k else "", "apiVersion": RECHARGE_VERSION}
+    if not k or not qs.get("test"):
+        return out
+    try:
+        recharge_get("/customers", {"limit": 1}, tries=1)
+        return dict(out, ok=True, message="Connected — the key can read Recharge customers.")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:300]
+        plain = "The key was rejected (invalid, revoked, or missing read scopes)." if e.code in (401, 403) else f"Recharge returned {e.code}."
+        return dict(out, ok=False, message=plain, apiMessage=body)
+    except Exception as e:
+        return dict(out, ok=False, message="Couldn't reach Recharge: " + str(e)[:200])
+
 UUID_RX = r"(?P<id>[0-9a-fA-F-]{32,36})"
 KEY_RX  = r"(?P<key>[A-Za-z0-9_.\-]+)"
 # (method, path regex, fn, min role rank, is_write).  Writes are refused until cutover.
@@ -2112,6 +2216,10 @@ ROUTES = [
     ("GET",    r"/insights/" + UUID_RX,               api_insight_get,          1, False),
     ("DELETE", r"/insights/" + UUID_RX,               api_insight_delete,       2, True),
     ("GET",    r"/admin/status",                      api_admin_status,         2, False),
+    ("GET",    r"/admin/ai-status",                   api_ai_status,            2, False),
+    ("POST",   r"/recharge/lookup",                   api_recharge_lookup,      1, True),
+    ("GET",    r"/admin/recharge-status",             api_recharge_status,      2, False),
+    ("POST",   r"/admin/ai-test",                     api_ai_test,              2, True),
     ("POST",   r"/admin/import",                      api_admin_import,         2, False),
     ("POST",   r"/admin/verify",                      api_admin_verify,         2, False),
     ("GET",    r"/admin/verify/report",               api_admin_verify_report,  2, False),
