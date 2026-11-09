@@ -2,10 +2,19 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.15.1
+  Version:  3.16.0
   Date:     2026-11-05
 
   Changelog:
+  v3.16.0 (2026-11-05) -- BATCH FETCH SQL: SKIP TICKETS WITH NO CUSTOMER MESSAGE; BOTS NEVER COUNT AS REPLIES
+    - per_ticket now has HAVING COUNTIF(m.from_agent = FALSE) > 0: tickets where the customer never wrote are skipped
+      (agent-initiated check-ins closed by the no-response rule, e.g. #470293518; bare "Shopify Alert Delivery Failed"
+      alerts). Over Oct 12 - Nov 1 that's ~1,180 tickets, 59 of which could pass the reply floor; tickets with any
+      customer message are unaffected.
+    - Automated senders never count toward the agent-reply floor: a "bots" CTE matches gaia.users whose name contains
+      the word "bot" or whose email starts with bot@ or ends @emails.gorgias.com (17 users today: Gorgias Bot, Helpdesk /
+      Help Center / Workflows bots, Chat Api Bot, ...), so new bot users are covered without a code change.
+
   v3.15.1 (2026-11-05) -- FIX: the Gorgias ticket SUBJECT was never saved on audits created by AI Audit (batch), Manual Audit
     or Delete & Replace (only Re-audit saved it), so tickets.subject was empty for most audits. All four paths save it now.
     Existing audits keep an empty subject; identify them by transcript instead (e.g. Shopify alert text).
@@ -1092,7 +1101,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.15.1";
+const APP_VERSION = "v3.16.0";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -6375,22 +6384,34 @@ Rules:
     return "-- Wingman Fetch v2 — "+mnlWeekLabel(mon)+"\n"
       +"-- Top "+target+" tickets per agent, ranked by "+(v2Active.length?"filter mismatch, then ":"")+"assigned-agent public replies (floor "+floor+").\n"
       +filterNote
-      +"WITH per_ticket AS (\n"
+      // v3.16.0: (1) skip tickets where the customer never wrote (outbound check-ins, bare Shopify alerts);
+      //          (2) automated senders (Gorgias Bot, rules, workflows, other bot users) never count toward the reply floor.
+      +"-- Excludes tickets with no customer message, and bot/automated messages never count as agent replies.\n"
+      +"WITH bots AS (\n"
+      +"  SELECT gorgias_user_id FROM gaia.users\n"
+      +"  WHERE REGEXP_CONTAINS(LOWER(COALESCE(name, '')), r'\\bbot\\b')\n"
+      +"     OR LOWER(COALESCE(email, '')) LIKE 'bot@%'\n"
+      +"     OR LOWER(COALESCE(email, '')) LIKE '%@emails.gorgias.com'\n"
+      +"),\n"
+      +"per_ticket AS (\n"
       +"  SELECT\n"
       +"    t.ticket_id,\n"
       +"    t.assignee_user_id,\n"
       +"    COUNTIF(\n"
       +"      m.from_agent = TRUE\n"
       +"      AND m.sender_id = t.assignee_user_id\n"
+      +"      AND b.gorgias_user_id IS NULL\n"
       +"      AND JSON_VALUE(m.source, '$.type') != 'internal-note'\n"
       +"      AND COALESCE(m.is_ai_agent_message, FALSE) = FALSE\n"
       +"    ) AS agent_msgs\n"
       +"  FROM gaia.tickets AS t\n"
       +"  CROSS JOIN UNNEST(t.ticket_messages) AS m\n"
+      +"  LEFT JOIN bots AS b ON b.gorgias_user_id = m.sender_id\n"
       +"  WHERE t.ticket_created_date BETWEEN '"+d(start)+"' AND '"+d(end)+"'\n"
       +"    AND COALESCE(t.is_spam, FALSE) = FALSE\n"
       +"    AND t.assignee_user_id IS NOT NULL\n"
       +"  GROUP BY 1, 2\n"
+      +"  HAVING COUNTIF(m.from_agent = FALSE) > 0   -- the customer wrote at least once\n"
       +"),\n"
       +ctfSql.ctes
       +"ranked AS (\n"
