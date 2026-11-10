@@ -2,10 +2,20 @@
 <!--
   Freedom Grooming QA Tool (Wingman)
   ==================================
-  Version:  3.17.0
-  Date:     2026-11-09
+  Version:  3.18.0
+  Date:     2026-11-10
 
   Changelog:
+  v3.18.0 (2026-11-10) -- TRANSCRIPT LABELS FOR SMS / POSTSCRIPT TICKETS (facts only, no scoring rules)
+    - Customer messages with no sender name (SMS replies relayed by Postscript arrive as e.g. 16825511057@postscriptapp.com)
+      now use the customer's name from elsewhere in the conversation, instead of "Customer". Before, one person showed
+      as "[Customer - WoOGie Mayne]" and "[Customer - Customer]" in the same ticket (#470423836), and the AI read the
+      later messages as someone else and wrongly concluded "the customer never replied" (false autofail).
+    - Outbound marketing texts sent through Postscript by the brand (sender like freebird@postscriptapp.com, i.e. not a
+      phone number) are labelled "[Brand SMS - Postscript]", never as the customer.
+    - Applies to transcripts built from now on (all fetch paths). Saved transcripts are unchanged; re-fetching
+      (Re-audit, or the re-score tool's cut-off mode) rebuilds them.
+
   v3.17.0 (2026-11-09) -- RECHARGE: SUBSCRIPTION FACTS FOR SCORING
     - Tickets whose Contact Reason is in a configurable list (Admin Tools > Recharge; default Cancel::Subscription (Aware)
       and (Unaware)) get a read-only Recharge lookup by the ticket's customer email before scoring: subscriptions (status,
@@ -1115,7 +1125,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // The Python /proxy injects them server-side based on destination host.
 const NOTION_VERSION = "2022-06-28";
 
-const APP_VERSION = "v3.17.0";
+const APP_VERSION = "v3.18.0";
 // ── Debug log buffer ─────────────────────────────────────────────────────────
 // Ring buffer of recent events + uncaught errors, so user-reported issues can be
 // traced. Export via the Settings tab button or exportWingmanLog() in the console.
@@ -6031,10 +6041,20 @@ Rules:
   function buildTranscript(messages) {
     var sorted = messages.slice().sort(function(a,b){return (a.created_datetime||"").localeCompare(b.created_datetime||"");});
     var lines = [];
+    // v3.18.0 labels (facts only): (1) outbound marketing texts sent through Postscript by the brand (sender like
+    // freebird@postscriptapp.com, not a phone number) are labelled "Brand SMS - Postscript", never "Customer";
+    // (2) customer messages with no sender name (e.g. SMS replies relayed by Postscript) use the customer's name
+    // from elsewhere in the same conversation, so one person isn't split into "<Name>" and "Customer".
+    var senderEmail = function(m){ return String(((m.sender||{}).email) || (((m.source||{}).from||{}).address) || "").toLowerCase(); };
+    var isBrandSms = function(m){ var mm = senderEmail(m).match(/^([^@]+)@postscriptapp\.com$/); return !!(mm && !/^\+?\d+$/.test(mm[1])); };
+    var isAgentMsg = function(m){ return !!(m.from_agent || ((m.sender||{}).meta||{}).is_staff); };
+    var customerName = "";
+    sorted.some(function(m){ if(!isAgentMsg(m) && !isBrandSms(m) && (m.sender||{}).name){ customerName = String(m.sender.name).trim(); return true; } return false; });
     sorted.forEach(function(m){
-      var isAgent = m.from_agent || ((m.sender||{}).meta||{}).is_staff;
-      var role = isAgent ? "Agent" : "Customer";
-      var sender = (m.sender||{}).name || role;
+      var isAgent = isAgentMsg(m);
+      var brand = !isAgent && isBrandSms(m);
+      var role = isAgent ? "Agent" : brand ? "Brand SMS" : "Customer";
+      var sender = brand ? "Postscript" : ((m.sender||{}).name || (isAgent ? role : (customerName || role)));
       var bodyText = (m.body_text||"").trim();
       var bodyHtml = m.body_html || m.body || "";
       var body = (bodyText && !/<[a-zA-Z]/.test(bodyText)) ? bodyText : stripHTML(bodyHtml);
